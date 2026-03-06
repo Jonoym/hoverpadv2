@@ -1,0 +1,24 @@
+[package]
+name = "hoverpad"
+version = "0.1.0"
+description = "Desktop overlay app for managing markdown notes and tracking Claude Code CLI sessions"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "hoverpad_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-fs = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-process = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7"] }
+tokio = { version = "1", features = ["full"] }

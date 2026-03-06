@@ -1,0 +1,89 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for all windows",
+  "windows": ["main", "note-*", "session-*"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-create",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-set-focus",
+    "core:webview:allow-create-webview-window",
+    "core:event:default",
+    "sql:default",
+    "sql:allow-execute",
+    "sql:allow-select",
+    "sql:allow-close",
+    "fs:default",
+    {
+      "identifier": "fs:allow-read-text-file",
+      "allow": [
+        { "path": "$HOME/hoverpad/**" },
+        { "path": "$HOME/.claude/**" },
+        { "path": "$APPDATA/**" },
+        { "path": "$APPCONFIG/**" },
+        { "path": "$APPLOCALDATA/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [
+        { "path": "$HOME/hoverpad/**" },
+        { "path": "$APPDATA/**" },
+        { "path": "$APPCONFIG/**" },
+        { "path": "$APPLOCALDATA/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-exists",
+      "allow": [
+        { "path": "$HOME/hoverpad" },
+        { "path": "$HOME/hoverpad/**" },
+        { "path": "$HOME/.claude" },
+        { "path": "$HOME/.claude/**" },
+        { "path": "$APPDATA/**" },
+        { "path": "$APPCONFIG/**" },
+        { "path": "$APPLOCALDATA/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [
+        { "path": "$HOME/hoverpad" },
+        { "path": "$HOME/hoverpad/**" },
+        { "path": "$APPDATA/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-dir",
+      "allow": [
+        { "path": "$HOME/hoverpad/**" },
+        { "path": "$HOME/.claude" },
+        { "path": "$HOME/.claude/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-remove",
+      "allow": [
+        { "path": "$HOME/hoverpad/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-rename",
+      "allow": [
+        { "path": "$HOME/hoverpad/**" }
+      ]
+    },
+    "process:default",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-inner-size",
+    "core:window:allow-inner-position",
+    "core:window:allow-outer-size",
+    "core:window:allow-outer-position",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-current-monitor",
+    "core:window:allow-set-ignore-cursor-events"
+  ]
+}

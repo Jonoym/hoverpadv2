@@ -1,3 +1,9 @@
+---
+name: backend
+description: Tauri v2 Rust backend and SQLite conventions for Hoverpad. Covers architecture, database schema, file system layout, Claude session monitoring, and Tauri commands/plugins.
+user-invocable: false
+---
+
 # Backend & Database
 
 Tauri v2 Rust backend and SQLite conventions for Hoverpad.

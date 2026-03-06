@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(orchestrator)",
+      "mcp__claude_ai_Context7__resolve-library-id",
+      "WebSearch",
+      "WebFetch(domain:v2.tauri.app)",
+      "WebFetch(domain:ui.shadcn.com)",
+      "Bash(node:*)",
+      "Bash(rustup default:*)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vite:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(timeout 30 npm run:*)",
+      "Bash(taskkill:*)"
+    ]
+  }
+}

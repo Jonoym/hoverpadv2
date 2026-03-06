@@ -1,3 +1,9 @@
+---
+name: styling
+description: Tailwind CSS v4 + shadcn/ui styling conventions for Hoverpad. Covers design language, MDXEditor theming, cross-window theming, and platform-specific considerations.
+user-invocable: false
+---
+
 # Styling
 
 Tailwind CSS v4 + shadcn/ui conventions for Hoverpad. See [ADR-001](../../docs/adrs/ADR-001-css-framework.md).

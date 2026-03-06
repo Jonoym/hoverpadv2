@@ -1,3 +1,10 @@
+---
+name: adr-writer
+description: Write Architecture Decision Records for the Hoverpad project following the standard template and numbering conventions.
+allowed-tools: Read, Write, Edit, Glob, Grep
+argument-hint: "[title]"
+---
+
 # ADR Writer
 
 Write Architecture Decision Records for the Hoverpad project.

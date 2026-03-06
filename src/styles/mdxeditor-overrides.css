@@ -1,0 +1,355 @@
+/*
+ * MDXEditor dark theme overrides for Hoverpad.
+ *
+ * MDXEditor uses the `.dark-theme` class on its root element to enable
+ * dark mode. We also override various CSS custom properties and element
+ * styles to match the app's neutral dark palette.
+ */
+
+/* ------------------------------------------------------------------ */
+/* Dark theme: background, text, and border colours                   */
+/* ------------------------------------------------------------------ */
+
+.dark-theme {
+  --accentBase: oklch(0.488 0.243 264.376);
+  --accentBgSubtle: oklch(0.269 0 0);
+  --accentTextContrast: oklch(0.985 0 0);
+  --accentSolid: oklch(0.488 0.243 264.376);
+  --baseBase: oklch(0.145 0 0);
+  --baseBgSubtle: oklch(0.205 0 0);
+  --baseBgActive: oklch(0.269 0 0);
+  --baseBorder: oklch(0.35 0 0);
+  --baseBorderHover: oklch(0.439 0 0);
+  --baseSolid: oklch(0.556 0 0);
+  --baseSolidHover: oklch(0.708 0 0);
+  --baseText: oklch(0.985 0 0);
+  --baseTextContrast: oklch(0.985 0 0);
+  --baseTextHighContrast: oklch(1 0 0);
+
+  color-scheme: dark;
+}
+
+/* Editor root: transparent bg so WindowChrome shows through */
+.dark-theme.mdxeditor {
+  background: transparent;
+  color: oklch(0.92 0 0);
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Ensure text selection works inside the editor (WindowChrome sets select-none) */
+.dark-theme [role="textbox"],
+.dark-theme .cm-editor {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Ensure the editor fills available space with proper flex layout */
+.dark-theme.mdxeditor > div {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.dark-theme .mdxeditor-root-contenteditable {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Toolbar styling */
+.dark-theme .mdxeditor-toolbar {
+  background: oklch(0.205 0 0);
+  border-color: oklch(0.3 0 0);
+  border-radius: 0.5rem;
+  gap: 2px;
+}
+
+/* Toolbar buttons */
+.dark-theme .mdxeditor-toolbar button,
+.dark-theme .mdxeditor-toolbar [role="button"] {
+  color: oklch(0.75 0 0);
+}
+
+.dark-theme .mdxeditor-toolbar button:hover,
+.dark-theme .mdxeditor-toolbar [role="button"]:hover {
+  background: oklch(0.3 0 0);
+  color: oklch(0.92 0 0);
+}
+
+.dark-theme .mdxeditor-toolbar button[data-state="on"],
+.dark-theme .mdxeditor-toolbar [role="button"][data-state="on"] {
+  background: oklch(0.35 0 0);
+  color: oklch(0.985 0 0);
+}
+
+/* Select / dropdown triggers inside toolbar */
+.dark-theme .mdxeditor-toolbar select,
+.dark-theme .mdxeditor-toolbar [role="combobox"] {
+  background: oklch(0.25 0 0);
+  color: oklch(0.85 0 0);
+  border-color: oklch(0.35 0 0);
+}
+
+/* Popup / dialog (e.g. link dialog) */
+.dark-theme [role="dialog"] {
+  background: oklch(0.205 0 0);
+  border: 1px solid oklch(0.3 0 0);
+  color: oklch(0.92 0 0);
+}
+
+.dark-theme [role="dialog"] input {
+  background: oklch(0.15 0 0);
+  border-color: oklch(0.35 0 0);
+  color: oklch(0.92 0 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Content area: restore element styles stripped by Tailwind preflight */
+/* ------------------------------------------------------------------ */
+
+.dark-theme .mdxeditor-rich-text-editor {
+  padding: 0.75rem 1rem;
+}
+
+/* Headings */
+.dark-theme [role="textbox"] h1 {
+  font-size: 2em;
+  font-weight: 700;
+  margin-top: 0.67em;
+  margin-bottom: 0.67em;
+  line-height: 1.2;
+  color: oklch(0.985 0 0);
+}
+
+.dark-theme [role="textbox"] h2 {
+  font-size: 1.5em;
+  font-weight: 600;
+  margin-top: 0.83em;
+  margin-bottom: 0.83em;
+  line-height: 1.25;
+  color: oklch(0.97 0 0);
+}
+
+.dark-theme [role="textbox"] h3 {
+  font-size: 1.25em;
+  font-weight: 600;
+  margin-top: 1em;
+  margin-bottom: 1em;
+  line-height: 1.3;
+  color: oklch(0.95 0 0);
+}
+
+.dark-theme [role="textbox"] h4 {
+  font-size: 1.1em;
+  font-weight: 600;
+  margin-top: 1.33em;
+  margin-bottom: 1.33em;
+  line-height: 1.35;
+  color: oklch(0.92 0 0);
+}
+
+.dark-theme [role="textbox"] h5 {
+  font-size: 1em;
+  font-weight: 600;
+  margin-top: 1.67em;
+  margin-bottom: 1.67em;
+  color: oklch(0.9 0 0);
+}
+
+.dark-theme [role="textbox"] h6 {
+  font-size: 0.875em;
+  font-weight: 600;
+  margin-top: 2.33em;
+  margin-bottom: 2.33em;
+  color: oklch(0.85 0 0);
+}
+
+/* Paragraph */
+.dark-theme [role="textbox"] p {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+  line-height: 1.625;
+}
+
+/* Lists */
+.dark-theme [role="textbox"] ul {
+  list-style-type: disc;
+  padding-left: 1.5em;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.dark-theme [role="textbox"] ol {
+  list-style-type: decimal;
+  padding-left: 1.5em;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.dark-theme [role="textbox"] li {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+  line-height: 1.625;
+}
+
+/* Nested lists */
+.dark-theme [role="textbox"] ul ul,
+.dark-theme [role="textbox"] ol ul {
+  list-style-type: circle;
+}
+
+.dark-theme [role="textbox"] ul ul ul,
+.dark-theme [role="textbox"] ol ul ul {
+  list-style-type: square;
+}
+
+/* Task / check lists */
+.dark-theme [role="textbox"] li[role="checkbox"] {
+  list-style-type: none;
+  position: relative;
+  padding-left: 0.25em;
+}
+
+/* Blockquote */
+.dark-theme [role="textbox"] blockquote {
+  border-left: 3px solid oklch(0.488 0.243 264.376);
+  padding-left: 1em;
+  margin-left: 0;
+  margin-right: 0;
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+  color: oklch(0.75 0 0);
+  font-style: italic;
+}
+
+/* Horizontal rule */
+.dark-theme [role="textbox"] hr {
+  border: none;
+  border-top: 1px solid oklch(0.35 0 0);
+  margin-top: 1.5em;
+  margin-bottom: 1.5em;
+}
+
+/* Links */
+.dark-theme [role="textbox"] a {
+  color: oklch(0.65 0.2 260);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.dark-theme [role="textbox"] a:hover {
+  color: oklch(0.75 0.2 260);
+}
+
+/* Inline code */
+.dark-theme [role="textbox"] code {
+  background: oklch(0.25 0 0);
+  padding: 0.15em 0.35em;
+  border-radius: 0.25em;
+  font-size: 0.875em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+/* Code blocks */
+.dark-theme [role="textbox"] pre {
+  background: oklch(0.18 0 0);
+  border: 1px solid oklch(0.3 0 0);
+  border-radius: 0.5rem;
+  padding: 0.75em 1em;
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+  overflow-x: auto;
+  font-size: 0.875em;
+}
+
+.dark-theme [role="textbox"] pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+/* Tables */
+.dark-theme [role="textbox"] table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+}
+
+.dark-theme [role="textbox"] th,
+.dark-theme [role="textbox"] td {
+  border: 1px solid oklch(0.35 0 0);
+  padding: 0.5em 0.75em;
+  text-align: left;
+}
+
+.dark-theme [role="textbox"] th {
+  background: oklch(0.22 0 0);
+  font-weight: 600;
+}
+
+.dark-theme [role="textbox"] tr:nth-child(even) {
+  background: oklch(0.17 0 0);
+}
+
+/* Strong & emphasis */
+.dark-theme [role="textbox"] strong {
+  font-weight: 700;
+  color: oklch(0.985 0 0);
+}
+
+.dark-theme [role="textbox"] em {
+  font-style: italic;
+}
+
+/* ------------------------------------------------------------------ */
+/* Source / diff view                                                  */
+/* ------------------------------------------------------------------ */
+
+.dark-theme .cm-editor {
+  background: oklch(0.15 0 0);
+}
+
+.dark-theme .cm-editor .cm-content {
+  color: oklch(0.85 0 0);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+.dark-theme .cm-editor .cm-gutters {
+  background: oklch(0.18 0 0);
+  border-color: oklch(0.3 0 0);
+  color: oklch(0.5 0 0);
+}
+
+.dark-theme .cm-editor .cm-activeLine {
+  background: oklch(0.2 0 0);
+}
+
+.dark-theme .cm-editor .cm-activeLineGutter {
+  background: oklch(0.22 0 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Scrollbar within the editor content area                           */
+/* ------------------------------------------------------------------ */
+
+.dark-theme [role="textbox"]::-webkit-scrollbar {
+  width: 6px;
+}
+
+.dark-theme [role="textbox"]::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.dark-theme [role="textbox"]::-webkit-scrollbar-thumb {
+  background: oklch(0.35 0 0);
+  border-radius: 3px;
+}
+
+.dark-theme [role="textbox"]::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.45 0 0);
+}

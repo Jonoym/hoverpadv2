@@ -1,3 +1,9 @@
+---
+name: frontend
+description: React + TypeScript conventions for Hoverpad. Covers component structure, TypeScript rules, Zustand state management, multi-window architecture, and file naming.
+user-invocable: false
+---
+
 # Frontend Development
 
 React + TypeScript conventions for Hoverpad.
