@@ -1,43 +1,39 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { currentMonitor } from "@tauri-apps/api/window";
 import { PhysicalSize, PhysicalPosition, LogicalSize, LogicalPosition } from "@tauri-apps/api/dpi";
 import { useShallow } from "zustand/react/shallow";
 import { cn } from "@/lib/utils";
-import { createNoteWindow, createSessionWindow } from "@/lib/windowManager";
-import { listenEvent, type HoverpadEventName } from "@/lib/events";
-import { getDatabaseStatus, type DatabaseStatus } from "@/lib/database";
-import { createNote, setNoteOpen, listNotes } from "@/lib/noteService";
-import { useGlobalStore, selectOpenNoteCount, selectActiveSessionCount } from "@/stores/globalStore";
+import { createNoteWindow, createSessionWindow, createSessionGroupWindow, createCustomGroupWindow, createLogFileWindow } from "@/lib/windowManager";
+
+import { listNotes } from "@/lib/noteService";
+import { listenEvent } from "@/lib/events";
+import { discoverSessions, listOpenSessionGroups } from "@/lib/sessionService";
+import { listOpenLogFiles } from "@/lib/logFileService";
+import { getDatabase } from "@/lib/database";
+import { useGlobalStore, selectOpenNoteCount } from "@/stores/globalStore";
 import { WindowChrome } from "@/components/WindowChrome";
 import { NoteList } from "@/components/NoteList";
 import { SessionList } from "@/components/SessionList";
 import { KanbanBoard } from "@/components/kanban/KanbanBoard";
+import { SettingsPanel } from "@/components/SettingsPanel";
 import { CollapsedTab } from "@/components/CollapsedTab";
 
-const COLLAPSED_WIDTH = 220;
+const COLLAPSED_WIDTH = 320;
 const COLLAPSED_HEIGHT = 50;
 
-interface EventLogEntry {
-  id: number;
-  time: string;
-  event: string;
-  payload: string;
-}
+/** Target logical widths per view. */
+const VIEW_WIDTHS: Record<string, number> = {
+  notes: 750,
+  board: 1111,
+  sessions: 500,
+};
 
-let nextId = 0;
 
 export function ControlPanel() {
-  const [eventLog, setEventLog] = useState<EventLogEntry[]>([]);
-  const [dbStatus, setDbStatus] = useState<
-    | { state: "loading" }
-    | { state: "ready"; data: DatabaseStatus }
-    | { state: "error"; message: string }
-  >({ state: "loading" });
-  const [eventLogOpen, setEventLogOpen] = useState(false);
-
   // View switcher state
   const [activeView, setActiveView] = useState<"notes" | "board" | "sessions">("notes");
+  const [showSettings, setShowSettings] = useState(false);
 
   // Collapse/expand state
   const [isCollapsed, setIsCollapsed] = useState(false);
@@ -45,81 +41,204 @@ export function ControlPanel() {
   const [expandedPosition, setExpandedPosition] = useState<{ x: number; y: number } | null>(null);
 
   // Subscribe to global store
-  const { notes, notesLoading, refreshNotes, sessions, sessionsLoading, refreshSessions } = useGlobalStore(
+  const { notes, notesLoading, refreshNotes, sessions, refreshSessions, hydrateSessions } = useGlobalStore(
     useShallow((s) => ({
       notes: s.notes,
       notesLoading: s.notesLoading,
       refreshNotes: s.refreshNotes,
       sessions: s.sessions,
-      sessionsLoading: s.sessionsLoading,
       refreshSessions: s.refreshSessions,
+      hydrateSessions: s.hydrateSessions,
     })),
   );
   const noteCount = useGlobalStore(selectOpenNoteCount);
-  const sessionCount = useGlobalStore(selectActiveSessionCount);
+  const collapseToggleCount = useGlobalStore((s) => s.collapseToggleCount);
+  const hideChildrenToggleCount = useGlobalStore((s) => s.hideChildrenToggleCount);
+  const childrenHidden = useGlobalStore((s) => s.childrenHidden);
+  const isHidden = useGlobalStore((s) => s.isHidden);
 
-  useEffect(() => {
-    getDatabaseStatus()
-      .then((data) => setDbStatus({ state: "ready", data }))
-      .catch((err: unknown) =>
-        setDbStatus({
-          state: "error",
-          message: err instanceof Error ? err.message : String(err),
-        }),
-      );
-
-    // Hydrate the note list and session list from the database
-    void refreshNotes();
-    void refreshSessions();
-  }, [refreshNotes, refreshSessions]);
-
-  // Restore previously open note windows on app launch
-  useEffect(() => {
-    listNotes()
-      .then((allNotes) => {
-        for (const note of allNotes) {
-          if (note.isOpen) {
-            createNoteWindow(note.id).catch(console.error);
-          }
-        }
-      })
-      .catch(console.error);
-  }, []); // Run once on mount
-
-  const addLogEntry = useCallback((event: string, payload: unknown) => {
-    const entry: EventLogEntry = {
-      id: nextId++,
-      time: new Date().toLocaleTimeString(),
-      event,
-      payload: JSON.stringify(payload),
-    };
-    setEventLog((prev) => [entry, ...prev].slice(0, 50));
+  const switchView = useCallback((view: "notes" | "board" | "sessions") => {
+    setShowSettings(false);
+    setActiveView(view);
+    const appWindow = getCurrentWebviewWindow();
+    void appWindow.innerSize().then((size) => {
+      void currentMonitor().then((monitor) => {
+        const scale = monitor?.scaleFactor ?? 1;
+        const currentHeight = size.height / scale;
+        void appWindow.setSize(new LogicalSize(VIEW_WIDTHS[view]!, currentHeight));
+      });
+    });
   }, []);
 
   useEffect(() => {
-    const eventNames: HoverpadEventName[] = [
-      "window:opened",
-      "window:closed",
-      "test:ping",
-    ];
+    // Fast: load sessions from DB so names/labels appear instantly
+    void hydrateSessions();
+    // Hydrate the note list and do full session discovery (disk scan)
+    void refreshNotes();
+    void refreshSessions();
 
-    const unlisteners = eventNames.map((name) =>
-      listenEvent(name, (e) => {
-        addLogEntry(name, e.payload);
+    // Poll sessions every 5s so status changes (running → idle) are picked up
+    const interval = setInterval(() => { void refreshSessions(); }, 5_000);
 
-        // Refresh the note list when a window is closed (updates isOpen status)
-        if (name === "window:closed") {
-          void refreshNotes();
-        }
-      }),
-    );
+    // Refresh immediately when renames happen in other windows
+    const unlistenNote = listenEvent("note:renamed", () => { void refreshNotes(); });
+    const unlistenSession = listenEvent("session:renamed", () => { void refreshSessions(); });
 
     return () => {
-      unlisteners.forEach((p) => {
-        p.then((unlisten) => unlisten()).catch(console.error);
-      });
+      clearInterval(interval);
+      unlistenNote.then((fn) => fn()).catch(console.error);
+      unlistenSession.then((fn) => fn()).catch(console.error);
     };
-  }, [addLogEntry, refreshNotes]);
+  }, [refreshNotes, refreshSessions, hydrateSessions]);
+
+  // Restore previously open windows on app launch.
+  // Module-level guard prevents duplicate restores from React StrictMode double-mount.
+  const restoreGuardRef = useRef(false);
+  useEffect(() => {
+    if (restoreGuardRef.current) return;
+    restoreGuardRef.current = true;
+    (async () => {
+      try {
+        // Read which windows were open, then immediately clear all is_open
+        // flags. Each window component re-sets is_open=1 on mount, so if the
+        // app crashes before cleanup runs, flags won't be stale next launch.
+        const db = await getDatabase();
+        const allNotes = await listNotes();
+        const openNotes = allNotes.filter((n) => n.isOpen);
+
+        const allSessions = await discoverSessions();
+        const openSessions = allSessions.filter((s) => s.isOpen);
+
+        const groups = await listOpenSessionGroups();
+        const logFiles = await listOpenLogFiles();
+
+        // Clear all is_open flags now — window components will re-set on mount
+        await db.execute("UPDATE notes SET is_open = 0 WHERE is_open = 1");
+        await db.execute("UPDATE sessions SET is_open = 0 WHERE is_open = 1");
+        await db.execute("UPDATE session_groups SET is_open = 0 WHERE is_open = 1");
+        await db.execute("UPDATE log_files SET is_open = 0 WHERE is_open = 1");
+
+        // Restore windows sequentially to avoid label races
+        for (const note of openNotes) {
+          await createNoteWindow(note.id);
+        }
+
+        for (const session of openSessions) {
+          await createSessionWindow(session.sessionId);
+        }
+
+        for (const group of groups) {
+          if (group.groupType === "project" && group.projectDir) {
+            await createSessionGroupWindow(group.projectDir);
+          } else if (group.groupType === "manual") {
+            await createCustomGroupWindow(group.id);
+          }
+        }
+
+        for (const lf of logFiles) {
+          await createLogFileWindow(lf.id);
+        }
+      } catch (err) {
+        console.error("[hoverpad] Failed to restore windows:", err);
+      }
+    })();
+  }, []); // Run once on mount
+
+  // ------------------------------------------------------------------
+  // Persist control panel state to SQLite settings table
+  // ------------------------------------------------------------------
+
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  // Save control panel geometry on collapse/expand and position changes
+  const saveControlPanelState = useCallback(async (
+    collapsed: boolean,
+    expSize: { width: number; height: number },
+    expPosition: { x: number; y: number } | null,
+    view: string,
+  ) => {
+    try {
+      const db = await getDatabase();
+      const value = JSON.stringify({ collapsed, expSize, expPosition, view });
+      await db.execute(
+        `INSERT INTO settings (key, value) VALUES ('control_panel_state', $1)
+         ON CONFLICT(key) DO UPDATE SET value = $1`,
+        [value],
+      );
+    } catch (err) {
+      console.error("[hoverpad] Failed to save control panel state:", err);
+    }
+  }, []);
+
+  // Debounced save on state changes (after initial load)
+  const initialLoadDone = useRef(false);
+  useEffect(() => {
+    if (!initialLoadDone.current) return;
+    clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = setTimeout(() => {
+      void saveControlPanelState(isCollapsed, expandedSize, expandedPosition, activeView);
+    }, 1000);
+    return () => clearTimeout(saveDebounceRef.current);
+  }, [isCollapsed, expandedSize, expandedPosition, activeView, saveControlPanelState]);
+
+  // Restore control panel state on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const db = await getDatabase();
+        const rows = await db.select<{ value: string }[]>(
+          "SELECT value FROM settings WHERE key = 'control_panel_state'",
+        );
+        if (rows.length === 0) {
+          initialLoadDone.current = true;
+          return;
+        }
+        const state = JSON.parse(rows[0]!.value) as {
+          collapsed?: boolean;
+          expSize?: { width: number; height: number };
+          expPosition?: { x: number; y: number } | null;
+          view?: string;
+        };
+
+        if (state.expSize) setExpandedSize(state.expSize);
+        if (state.expPosition) setExpandedPosition(state.expPosition);
+        if (state.view && ["notes", "board", "sessions"].includes(state.view)) {
+          setActiveView(state.view as "notes" | "board" | "sessions");
+        }
+
+        // Restore collapsed state — apply window geometry
+        const appWindow = getCurrentWebviewWindow();
+        if (state.collapsed) {
+          const monitor = await currentMonitor();
+          const screenWidth = monitor?.size.width ?? 1920;
+          const scaleFactor = monitor?.scaleFactor ?? 1;
+          const logicalScreenWidth = screenWidth / scaleFactor;
+          const centerX = Math.round((logicalScreenWidth - COLLAPSED_WIDTH) / 2);
+          await appWindow.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
+          await appWindow.setPosition(new LogicalPosition(centerX, 10));
+          setIsCollapsed(true);
+        } else if (state.expSize) {
+          // Apply view-specific width with saved height
+          const restoredView = (state.view && ["notes", "board", "sessions"].includes(state.view))
+            ? state.view
+            : "notes";
+          const targetWidth = VIEW_WIDTHS[restoredView] ?? VIEW_WIDTHS.notes!;
+          const monitor = await currentMonitor();
+          const scaleFactor = monitor?.scaleFactor ?? 1;
+          const physicalWidth = Math.round(targetWidth * scaleFactor);
+          await appWindow.setSize(new PhysicalSize(physicalWidth, state.expSize.height));
+          if (state.expPosition) {
+            await appWindow.setPosition(
+              new PhysicalPosition(state.expPosition.x, state.expPosition.y),
+            );
+          }
+        }
+      } catch (err) {
+        console.error("[hoverpad] Failed to restore control panel state:", err);
+      }
+      initialLoadDone.current = true;
+    })();
+  }, []);
 
   const handleCollapse = useCallback(async () => {
     const appWindow = getCurrentWebviewWindow();
@@ -137,19 +256,26 @@ export function ControlPanel() {
       const logicalScreenWidth = screenWidth / scaleFactor;
       const centerX = Math.round((logicalScreenWidth - COLLAPSED_WIDTH) / 2);
 
-      // Resize and reposition (collapsed uses logical sizes since they are constants)
+      // Hide content, resize, then show new content
+      document.documentElement.style.opacity = "0";
       await appWindow.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
       await appWindow.setPosition(new LogicalPosition(centerX, 10));
-
       setIsCollapsed(true);
+      requestAnimationFrame(() => {
+        document.documentElement.style.opacity = "";
+      });
     } catch (err) {
       console.error("[hoverpad] Failed to collapse:", err);
+      document.documentElement.style.opacity = "";
     }
   }, []);
 
   const handleExpand = useCallback(async () => {
     const appWindow = getCurrentWebviewWindow();
     try {
+      // Hide content, resize, then show new content
+      document.documentElement.style.opacity = "0";
+
       // Restore saved size using PhysicalSize (values were saved as physical pixels)
       await appWindow.setSize(
         new PhysicalSize(expandedSize.width, expandedSize.height),
@@ -171,223 +297,152 @@ export function ControlPanel() {
       }
 
       setIsCollapsed(false);
+      requestAnimationFrame(() => {
+        document.documentElement.style.opacity = "";
+      });
     } catch (err) {
       console.error("[hoverpad] Failed to expand:", err);
+      document.documentElement.style.opacity = "";
     }
   }, [expandedSize, expandedPosition]);
+
+  // React to global hotkey toggle-collapse
+  // Skip when everything is hidden (Ctrl+H) — collapse shouldn't unhide
+  const collapseToggleRef = useRef(collapseToggleCount);
+  useEffect(() => {
+    if (collapseToggleRef.current === collapseToggleCount) return;
+    collapseToggleRef.current = collapseToggleCount;
+
+    if (isHidden) return; // Don't toggle collapse while globally hidden
+
+    if (isCollapsed) {
+      void handleExpand();
+    } else {
+      void handleCollapse();
+    }
+  }, [collapseToggleCount, isCollapsed, isHidden, handleExpand, handleCollapse]);
+
+  // React to global hotkey hide-children
+  // Collapse the control panel when children are hidden, expand when shown
+  const hideChildrenRef = useRef(hideChildrenToggleCount);
+  useEffect(() => {
+    if (hideChildrenRef.current === hideChildrenToggleCount) return;
+    hideChildrenRef.current = hideChildrenToggleCount;
+
+    if (childrenHidden && !isCollapsed) {
+      void handleCollapse();
+    } else if (!childrenHidden && isCollapsed) {
+      void handleExpand();
+    }
+  }, [hideChildrenToggleCount, childrenHidden, isCollapsed, handleExpand, handleCollapse]);
 
   // Render collapsed tab if collapsed
   if (isCollapsed) {
     return (
       <CollapsedTab
         noteCount={noteCount}
-        sessionCount={sessionCount}
+        activeSessions={sessions.filter((s) => s.status === "active").length}
+        idleSessions={sessions.filter((s) => s.status === "idle").length}
+        idleAgentsSessions={sessions.filter((s) => s.status === "idle-agents").length}
+        doneSessions={sessions.filter((s) => s.status === "completed").length}
         onExpand={() => void handleExpand()}
       />
     );
   }
 
-  const handleNewNote = async () => {
-    try {
-      const note = await createNote();
-      await setNoteOpen(note.id, true);
-      await createNoteWindow(note.id);
-      // Refresh the global store so the new note appears everywhere
-      await refreshNotes();
-    } catch (err) {
-      console.error("[hoverpad] Failed to create note:", err);
-    }
-  };
-
-  const handleNewSession = async () => {
-    const id = `test-${Date.now()}`;
-    await createSessionWindow(id);
-  };
-
   return (
     <WindowChrome
       title="Hoverpad"
-      badge={{ label: "Control Panel", color: "blue" }}
+      showMinimize={false}
       onCollapse={() => void handleCollapse()}
     >
-      {/* Database status */}
-      <div
-        className={cn(
-          "rounded-lg border px-3 py-2 text-xs",
-          dbStatus.state === "ready"
-            ? "border-emerald-500/30 bg-emerald-600/10 text-emerald-400"
-            : dbStatus.state === "error"
-              ? "border-red-500/30 bg-red-600/10 text-red-400"
-              : "border-neutral-700/50 bg-neutral-800/50 text-neutral-500",
-        )}
-      >
-        {dbStatus.state === "loading" && "Initialising database..."}
-        {dbStatus.state === "error" && (
-          <span>
-            DB Error: <span className="font-mono">{dbStatus.message}</span>
-          </span>
-        )}
-        {dbStatus.state === "ready" && (
-          <span>
-            DB OK &mdash; {dbStatus.data.tables.length} tables (
-            {dbStatus.data.tables.join(", ")}), {dbStatus.data.columnCount}{" "}
-            kanban columns
-          </span>
-        )}
-      </div>
-
-      {/* Action buttons */}
-      <div className="flex gap-3">
-        <button
-          type="button"
-          onClick={handleNewNote}
-          className={cn(
-            "rounded-lg px-4 py-2 text-sm font-medium",
-            "bg-blue-600/20 text-blue-400",
-            "border border-blue-500/30",
-            "transition-colors duration-150 hover:bg-blue-600/30",
-          )}
-        >
-          New Note
-        </button>
-        <button
-          type="button"
-          onClick={handleNewSession}
-          className={cn(
-            "rounded-lg px-4 py-2 text-sm font-medium",
-            "bg-emerald-600/20 text-emerald-400",
-            "border border-emerald-500/30",
-            "transition-colors duration-150 hover:bg-emerald-600/30",
-          )}
-        >
-          New Session
-        </button>
-      </div>
-
       {/* View switcher tabs */}
-      <div className="flex gap-4 border-b border-neutral-700/50">
+      <div className="flex items-center border-b border-neutral-700/50">
+        <div className="flex gap-4">
+          <button
+            type="button"
+            onClick={() => switchView("notes")}
+            className={cn(
+              "border-b-2 pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
+              activeView === "notes" && !showSettings
+                ? "border-blue-500 text-neutral-100"
+                : "border-transparent text-neutral-500 hover:text-neutral-300",
+            )}
+          >
+            Notes
+          </button>
+          <button
+            type="button"
+            onClick={() => switchView("board")}
+            className={cn(
+              "border-b-2 pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
+              activeView === "board" && !showSettings
+                ? "border-blue-500 text-neutral-100"
+                : "border-transparent text-neutral-500 hover:text-neutral-300",
+            )}
+          >
+            Board
+          </button>
+          <button
+            type="button"
+            onClick={() => switchView("sessions")}
+            className={cn(
+              "border-b-2 pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
+              activeView === "sessions" && !showSettings
+                ? "border-blue-500 text-neutral-100"
+                : "border-transparent text-neutral-500 hover:text-neutral-300",
+            )}
+          >
+            Sessions
+          </button>
+        </div>
         <button
           type="button"
-          onClick={() => setActiveView("notes")}
+          onClick={() => setShowSettings((prev) => !prev)}
           className={cn(
-            "pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
-            activeView === "notes"
-              ? "border-b-2 border-blue-500 text-neutral-100"
-              : "text-neutral-500 hover:text-neutral-300",
+            "ml-auto border-b-2 px-3 pb-2 cursor-pointer transition-colors duration-150",
+            showSettings
+              ? "border-blue-500 text-neutral-100"
+              : "border-transparent text-neutral-500 hover:text-neutral-300",
           )}
+          title="Settings"
         >
-          Notes
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveView("board")}
-          className={cn(
-            "pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
-            activeView === "board"
-              ? "border-b-2 border-blue-500 text-neutral-100"
-              : "text-neutral-500 hover:text-neutral-300",
-          )}
-        >
-          Board
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveView("sessions")}
-          className={cn(
-            "pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
-            activeView === "sessions"
-              ? "border-b-2 border-blue-500 text-neutral-100"
-              : "text-neutral-500 hover:text-neutral-300",
-          )}
-        >
-          Sessions
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            className="h-4 w-4"
+          >
+            <path
+              fillRule="evenodd"
+              d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.416.587l1.25-.834a1 1 0 0 1 1.262.125l.962.962a1 1 0 0 1 .125 1.262l-.834 1.25c.245.445.443.919.587 1.416l1.473.294a1 1 0 0 1 .804.98v1.361a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.587 1.416l.834 1.25a1 1 0 0 1-.125 1.262l-.962.962a1 1 0 0 1-1.262.125l-1.25-.834a6.953 6.953 0 0 1-1.416.587l-.294 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.957 6.957 0 0 1-1.416-.587l-1.25.834a1 1 0 0 1-1.262-.125l-.962-.962a1 1 0 0 1-.125-1.262l.834-1.25a6.957 6.957 0 0 1-.587-1.416l-1.473-.294A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.587-1.416l-.834-1.25a1 1 0 0 1 .125-1.262l.962-.962A1 1 0 0 1 5.38 3.22l1.25.834a6.957 6.957 0 0 1 1.416-.587l.294-1.473ZM13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"
+              clipRule="evenodd"
+            />
+          </svg>
         </button>
       </div>
 
       {/* Content area */}
-      <div className="flex flex-1 flex-col gap-2 overflow-hidden">
-        {activeView === "notes" ? (
-          <div className="flex-1 overflow-y-auto">
-            <NoteList notes={notes} loading={notesLoading} />
-          </div>
-        ) : activeView === "board" ? (
-          <div className="flex-1 overflow-y-auto">
-            <KanbanBoard />
+      <div className="relative flex flex-1 flex-col gap-2 overflow-hidden">
+        {showSettings ? (
+          <div className="flex-1 overflow-y-auto p-2">
+            <SettingsPanel />
           </div>
         ) : (
-          <div className="flex-1 overflow-y-auto">
-            <SessionList sessions={sessions} loading={sessionsLoading} />
-          </div>
+          <>
+            <div className={cn("flex-1 overflow-auto pr-2", activeView !== "notes" && "hidden")}>
+              <NoteList notes={notes} loading={notesLoading} />
+            </div>
+            <div className={cn("flex-1 overflow-auto", activeView !== "board" && "hidden")}>
+              <KanbanBoard />
+            </div>
+            <div className={cn("flex-1 overflow-y-auto pr-2", activeView !== "sessions" && "hidden")}>
+              <SessionList sessions={sessions} onRefresh={refreshSessions} />
+            </div>
+          </>
         )}
       </div>
 
-      {/* Collapsible event log */}
-      <div className="flex flex-col gap-2">
-        <button
-          type="button"
-          onClick={() => setEventLogOpen((prev) => !prev)}
-          className="flex items-center gap-1.5 text-sm font-medium text-neutral-400 transition-colors duration-150 cursor-pointer hover:text-neutral-300"
-        >
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 10 10"
-            fill="none"
-            xmlns="http://www.w3.org/2000/svg"
-            className={cn(
-              "transition-transform",
-              eventLogOpen ? "rotate-90" : "rotate-0",
-            )}
-          >
-            <path
-              d="M3 1L7 5L3 9"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          Event Log
-          {eventLog.length > 0 && (
-            <span className="text-xs text-neutral-500">
-              ({eventLog.length})
-            </span>
-          )}
-        </button>
-        {eventLogOpen && (
-          <div
-            className={cn(
-              "max-h-48 overflow-y-auto rounded-lg",
-              "border border-neutral-700/50 bg-neutral-950/50 p-3",
-            )}
-          >
-            {eventLog.length === 0 ? (
-              <p className="text-xs text-neutral-500">
-                No events yet. Open a window and send events to see them here.
-              </p>
-            ) : (
-              <div className="flex flex-col gap-1">
-                {eventLog.map((entry) => (
-                  <div
-                    key={entry.id}
-                    className="flex items-baseline gap-2 text-xs"
-                  >
-                    <span className="shrink-0 font-mono text-neutral-500">
-                      {entry.time}
-                    </span>
-                    <span className="shrink-0 font-medium text-amber-400">
-                      {entry.event}
-                    </span>
-                    <span className="truncate text-neutral-400">
-                      {entry.payload}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
     </WindowChrome>
   );
 }

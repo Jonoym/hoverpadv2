@@ -2,9 +2,10 @@ import { lazy, Suspense, useRef, useState, useEffect, useCallback } from "react"
 import { useParams } from "react-router-dom";
 import type { MDXEditorMethods } from "@mdxeditor/editor";
 import { WindowChrome } from "@/components/WindowChrome";
-import { loadNote, saveNote, setNoteOpen } from "@/lib/noteService";
-import { useWindowStateSaver } from "@/lib/windowState";
+import { loadNote, saveNote, setNoteOpen, renameNote } from "@/lib/noteService";
+import { useWindowStateSaver, saveWindowState } from "@/lib/windowState";
 import { useGlobalStore } from "@/stores/globalStore";
+import { emitEvent, listenEvent } from "@/lib/events";
 
 const DEBOUNCE_MS = 1000;
 const SAVED_DISPLAY_MS = 1500;
@@ -53,6 +54,29 @@ export function NoteWindow() {
   // Persist window position/size to SQLite on move/resize
   useWindowStateSaver(id, "notes");
 
+  const handleRename = useCallback(async (newName: string) => {
+    if (!id) return;
+    try {
+      await renameNote(id, newName);
+      setTitle(newName);
+      await useGlobalStore.getState().refreshNotes();
+      await emitEvent("note:renamed", { noteId: id, newTitle: newName });
+    } catch (err) {
+      console.error("[hoverpad] Failed to rename note:", err);
+    }
+  }, [id]);
+
+  // Listen for renames from other windows (e.g. control panel)
+  useEffect(() => {
+    if (!id) return;
+    const unlisten = listenEvent("note:renamed", (e) => {
+      if (e.payload.noteId === id) {
+        setTitle(e.payload.newTitle);
+      }
+    });
+    return () => { unlisten.then((fn) => fn()).catch(console.error); };
+  }, [id]);
+
   // Refs for debounce and dirty tracking (avoid re-renders)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isDirtyRef = useRef(false);
@@ -85,8 +109,6 @@ export function NoteWindow() {
         await saveNote(noteId, markdown);
         isSavingRef.current = false;
         setSaveStatus("saved");
-        // Refresh the global store so title/timestamp updates propagate
-        void useGlobalStore.getState().refreshNotes();
         statusTimerRef.current = setTimeout(
           () => setSaveStatus("idle"),
           SAVED_DISPLAY_MS,
@@ -151,9 +173,12 @@ export function NoteWindow() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [id, performSave]);
 
-  // Handle window close: save if dirty, then mark note as not open
+  // Handle window close: save state + content, then mark note as not open
   const handleClose = useCallback(async () => {
     if (id) {
+      // Save window position/size immediately before closing
+      await saveWindowState(id, "notes");
+
       // Cancel any pending debounce
       if (debounceRef.current) {
         clearTimeout(debounceRef.current);
@@ -206,7 +231,7 @@ export function NoteWindow() {
   // Show loading state while content is being fetched
   if (loadError) {
     return (
-      <WindowChrome title="Note" badge={{ label: "Note", color: "blue" }} onBeforeClose={handleClose}>
+      <WindowChrome title="Note" onBeforeClose={handleClose}>
         <ErrorState message={loadError} />
       </WindowChrome>
     );
@@ -214,15 +239,19 @@ export function NoteWindow() {
 
   if (initialContent === null) {
     return (
-      <WindowChrome title="Note" badge={{ label: "Note", color: "blue" }} onBeforeClose={handleClose}>
+      <WindowChrome title="Note" onBeforeClose={handleClose}>
         <LoadingState />
       </WindowChrome>
     );
   }
 
   return (
-    <WindowChrome title={displayTitle} badge={{ label: "Note", color: "blue" }} onBeforeClose={handleClose}>
-      <Suspense fallback={<EditorFallback />}>
+    <WindowChrome
+      title={displayTitle}
+      onBeforeClose={handleClose}
+      onRename={(name) => void handleRename(name)}
+    >
+      <Suspense fallback={<EditorFallback />} >
         <NoteEditor
           ref={editorRef}
           initialMarkdown={initialContent}

@@ -1,9 +1,13 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { availableMonitors, currentMonitor } from "@tauri-apps/api/window";
+import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { emitEvent } from "./events";
 import { loadWindowState, type WindowState } from "./windowState";
+import { getDatabase } from "./database";
 
-/** Counter to offset windows so they don't stack exactly. */
-let windowCounter = 0;
+/** Default logical size for new windows (no saved state). */
+const DEFAULT_WIDTH = 600;
+const DEFAULT_HEIGHT = 800;
 
 /**
  * Resolves the base URL for new windows.
@@ -15,50 +19,133 @@ function getBaseUrl(): string {
   return window.location.origin;
 }
 
+/**
+ * Validate a saved window position against current monitor bounds.
+ * If the position is off-screen (e.g. monitor disconnected), returns a
+ * centered fallback on the primary monitor. Otherwise returns as-is.
+ */
+async function validateWindowState(
+  state: WindowState,
+): Promise<WindowState> {
+  try {
+    const monitors = await availableMonitors();
+    if (monitors.length === 0) return state;
+
+    // Check if the window's top-left corner is within any monitor
+    const isOnScreen = monitors.some((m) => {
+      const mx = m.position.x;
+      const my = m.position.y;
+      const mw = m.size.width;
+      const mh = m.size.height;
+      return state.x >= mx && state.x < mx + mw && state.y >= my && state.y < my + mh;
+    });
+
+    if (isOnScreen) return state;
+
+    // Off-screen — center on primary monitor (first in list)
+    const primary = monitors[0]!;
+    return {
+      x: primary.position.x + Math.round((primary.size.width - state.width) / 2),
+      y: primary.position.y + Math.round((primary.size.height - state.height) / 2),
+      width: state.width,
+      height: state.height,
+    };
+  } catch {
+    // If monitor detection fails, use the saved state as-is
+    return state;
+  }
+}
+
 interface WindowConfig {
   label: string;
   url: string;
-  width: number;
-  height: number;
-  windowType: "note" | "session";
+  /** Default logical width (falls back to DEFAULT_WIDTH). */
+  width?: number;
+  /** Default logical height (falls back to DEFAULT_HEIGHT). */
+  height?: number;
+  minWidth?: number;
+  minHeight?: number;
+  windowType: "note" | "session" | "session-group" | "logfile";
   savedState?: WindowState | null;
 }
 
-async function createWindow(config: WindowConfig): Promise<void> {
-  const { label, url, width, height, windowType, savedState } = config;
+/** Track in-flight window creations to prevent duplicate concurrent calls. */
+const pendingWindows = new Set<string>();
 
-  // Check if window already exists; if so, focus it
+async function createWindow(config: WindowConfig): Promise<void> {
+  const { label, url, width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT, minWidth, minHeight, windowType } = config;
+  let { savedState } = config;
+
+  // Guard: already being created by a concurrent call
+  if (pendingWindows.has(label)) return;
+
+  // Check if window already exists; if so, focus it and flash the title bar
   const existing = await WebviewWindow.getByLabel(label);
   if (existing) {
     await existing.setFocus();
+    await emitEvent("window:flash", { label });
     return;
   }
 
-  // Use saved state if available, otherwise offset from the default position
-  const offset = windowCounter * 30;
-  windowCounter++;
+  // Validate saved position against current monitor layout
+  if (savedState) {
+    savedState = await validateWindowState(savedState);
+  }
 
-  const webview = new WebviewWindow(label, {
-    url,
-    width: savedState?.width ?? width,
-    height: savedState?.height ?? height,
-    x: savedState?.x ?? 150 + offset,
-    y: savedState?.y ?? 150 + offset,
-    transparent: true,
-    decorations: false,
-    shadow: false,
-    alwaysOnTop: true,
-    title: `Hoverpad - ${windowType} ${label}`,
-  });
+  pendingWindows.add(label);
 
-  // Wait for the window to be created, then emit an event
-  webview.once("tauri://created", async () => {
-    await emitEvent("window:opened", { label, windowType });
-  });
+  // Wrap creation in a promise that resolves once the window is fully created,
+  // so callers can safely await before creating the next window.
+  const finalSavedState = savedState;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const webview = new WebviewWindow(label, {
+        url,
+        width,
+        height,
+        minWidth,
+        minHeight,
+        transparent: true,
+        decorations: false,
+        shadow: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        title: `Hoverpad - ${windowType} ${label}`,
+      });
 
-  webview.once("tauri://error", (e) => {
-    console.error(`Failed to create window ${label}:`, e);
-  });
+      webview.once("tauri://created", async () => {
+        try {
+          if (finalSavedState) {
+            await webview.setSize(new PhysicalSize(finalSavedState.width, finalSavedState.height));
+            await webview.setPosition(new PhysicalPosition(finalSavedState.x, finalSavedState.y));
+          } else {
+            const monitor = await currentMonitor();
+            if (monitor) {
+              const scale = monitor.scaleFactor;
+              const screenW = monitor.size.width / scale;
+              const screenH = monitor.size.height / scale;
+              const monX = monitor.position.x / scale;
+              const monY = monitor.position.y / scale;
+              const cx = Math.round(monX + (screenW - DEFAULT_WIDTH) / 2);
+              const cy = Math.round(monY + (screenH - DEFAULT_HEIGHT) / 2);
+              await webview.setPosition(new PhysicalPosition(cx * scale, cy * scale));
+            }
+          }
+        } catch (err) {
+          console.error(`[hoverpad] Failed to position window ${label}:`, err);
+        }
+        await emitEvent("window:opened", { label, windowType });
+        resolve();
+      });
+
+      webview.once("tauri://error", (e) => {
+        console.error(`Failed to create window ${label}:`, e);
+        reject(e);
+      });
+    });
+  } finally {
+    pendingWindows.delete(label);
+  }
 }
 
 /**
@@ -76,9 +163,69 @@ export async function createNoteWindow(noteId: string): Promise<void> {
   await createWindow({
     label,
     url,
-    width: 400,
-    height: 500,
+    minWidth: 300,
+    minHeight: 250,
     windowType: "note",
+    savedState,
+  });
+}
+
+/**
+ * Create a new session-group window showing all sessions for a project directory.
+ */
+export async function createSessionGroupWindow(projectDir: string): Promise<void> {
+  const encoded = encodeURIComponent(projectDir);
+  // Tauri labels must be alphanumeric + hyphens/underscores
+  const safeLabel = projectDir.replace(/[^a-zA-Z0-9-]/g, "_").slice(0, 60);
+  const label = `sg-${safeLabel}`;
+  const baseUrl = getBaseUrl();
+  const url = `${baseUrl}/session-group/project/${encoded}`;
+
+  // Look up group ID to load saved window state
+  let savedState: WindowState | null = null;
+  try {
+    const db = await getDatabase();
+    const rows = await db.select<{ id: string }[]>(
+      "SELECT id FROM session_groups WHERE group_type = 'project' AND project_dir = $1",
+      [projectDir],
+    );
+    if (rows.length > 0) {
+      savedState = await loadWindowState(rows[0]!.id, "session_groups");
+    }
+  } catch {
+    // best effort
+  }
+
+  await createWindow({
+    label,
+    url,
+    width: 300,
+    height: 500,
+    minWidth: 250,
+    minHeight: 200,
+    windowType: "session-group",
+    savedState,
+  });
+}
+
+/**
+ * Create a new window showing sessions for a custom (manual) group.
+ */
+export async function createCustomGroupWindow(groupId: string): Promise<void> {
+  const label = `session-group-custom-${groupId}`;
+  const baseUrl = getBaseUrl();
+  const url = `${baseUrl}/session-group/custom/${groupId}`;
+
+  const savedState = await loadWindowState(groupId, "session_groups");
+
+  await createWindow({
+    label,
+    url,
+    width: 300,
+    height: 500,
+    minWidth: 250,
+    minHeight: 200,
+    windowType: "session-group",
     savedState,
   });
 }
@@ -87,6 +234,26 @@ export async function createNoteWindow(noteId: string): Promise<void> {
  * Create a new session window.
  * Loads saved window state (position/size) from SQLite if available.
  */
+/**
+ * Create a window for viewing an arbitrary log file.
+ */
+export async function createLogFileWindow(logFileId: string): Promise<void> {
+  const label = `logfile-${logFileId}`;
+  const baseUrl = getBaseUrl();
+  const url = `${baseUrl}/log-file/${logFileId}`;
+
+  const savedState = await loadWindowState(logFileId, "log_files");
+
+  await createWindow({
+    label,
+    url,
+    minWidth: 350,
+    minHeight: 300,
+    windowType: "logfile",
+    savedState,
+  });
+}
+
 export async function createSessionWindow(sessionId: string): Promise<void> {
   const label = `session-${sessionId}`;
   const baseUrl = getBaseUrl();
@@ -98,8 +265,8 @@ export async function createSessionWindow(sessionId: string): Promise<void> {
   await createWindow({
     label,
     url,
-    width: 400,
-    height: 600,
+    minWidth: 350,
+    minHeight: 300,
     windowType: "session",
     savedState,
   });

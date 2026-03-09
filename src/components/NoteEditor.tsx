@@ -11,17 +11,15 @@ import {
   linkDialogPlugin,
   tablePlugin,
   codeBlockPlugin,
+  codeMirrorPlugin,
   frontmatterPlugin,
-  diffSourcePlugin,
   toolbarPlugin,
+  searchPlugin,
   BoldItalicUnderlineToggles,
-  BlockTypeSelect,
   ListsToggle,
-  CreateLink,
   InsertTable,
+  InsertCodeBlock,
   CodeToggle,
-  DiffSourceToggleWrapper,
-  UndoRedo,
   Separator,
 } from "@mdxeditor/editor";
 
@@ -81,32 +79,50 @@ export const NoteEditor = forwardRef<MDXEditorMethods, NoteEditorProps>(
             headingsPlugin(),
             listsPlugin(),
             quotePlugin(),
-            markdownShortcutPlugin(),
             thematicBreakPlugin(),
             linkPlugin(),
             linkDialogPlugin(),
             tablePlugin(),
             codeBlockPlugin({ defaultCodeBlockLanguage: "text" }),
+            codeMirrorPlugin({
+              codeBlockLanguages: {
+                text: "Plain Text",
+                js: "JavaScript",
+                jsx: "JavaScript (JSX)",
+                ts: "TypeScript",
+                tsx: "TypeScript (TSX)",
+                css: "CSS",
+                html: "HTML",
+                json: "JSON",
+                python: "Python",
+                rust: "Rust",
+                sql: "SQL",
+                markdown: "Markdown",
+                xml: "XML",
+                yaml: "YAML",
+                go: "Go",
+                java: "Java",
+                cpp: "C++",
+                php: "PHP",
+              },
+            }),
             frontmatterPlugin(),
-            diffSourcePlugin({ viewMode: "rich-text" }),
+            searchPlugin(),
             toolbarPlugin({
               toolbarContents: () => (
-                <DiffSourceToggleWrapper>
-                  <UndoRedo />
-                  <Separator />
+                <>
                   <BoldItalicUnderlineToggles />
-                  <Separator />
-                  <BlockTypeSelect />
                   <Separator />
                   <ListsToggle />
                   <Separator />
-                  <CreateLink />
                   <InsertTable />
                   <Separator />
                   <CodeToggle />
-                </DiffSourceToggleWrapper>
+                  <InsertCodeBlock />
+                </>
               ),
             }),
+            markdownShortcutPlugin(),
           ]}
         />
       </div>

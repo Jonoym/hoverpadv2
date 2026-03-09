@@ -53,3 +53,7 @@ The project follows an **orchestrator → agent → reviewer** cycle:
 - Zustand stores: `globalStore` (synced) and `localStore` (per window)
 - SQLite is source of truth; frontend state is derived
 - Note filenames are immutable after creation
+
+## Important
+
+All changes should be documented in docs/progress, docs/feedback, docs/adrs when necessary.`

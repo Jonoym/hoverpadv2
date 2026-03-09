@@ -1,30 +1,312 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::sync::Mutex;
 
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, State};
 
-/// Tracks whether all windows are currently visible.
-/// Starts as `true` since windows are shown on launch.
-struct VisibilityState(AtomicBool);
+#[cfg(desktop)]
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+/// Maps shortcut strings (e.g. "Ctrl+N") to action names (e.g. "new-note").
+/// Used by the global shortcut handler to determine which event to emit.
+struct HotkeyState {
+    bindings: Mutex<HashMap<String, String>>,
+}
+
+#[cfg(desktop)]
+fn parse_shortcut(s: &str) -> Result<Shortcut, String> {
+    let parts: Vec<&str> = s.split('+').collect();
+    if parts.len() < 2 {
+        return Err(format!("Invalid shortcut: {}", s));
+    }
+
+    let mut modifiers = Modifiers::empty();
+    for part in &parts[..parts.len() - 1] {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
+            "alt" => modifiers |= Modifiers::ALT,
+            "shift" => modifiers |= Modifiers::SHIFT,
+            "super" | "meta" => modifiers |= Modifiers::SUPER,
+            _ => return Err(format!("Unknown modifier: {}", part)),
+        }
+    }
+
+    let key_str = parts.last().unwrap();
+    let code = match key_str.to_uppercase().as_str() {
+        "A" => Code::KeyA,
+        "B" => Code::KeyB,
+        "C" => Code::KeyC,
+        "D" => Code::KeyD,
+        "E" => Code::KeyE,
+        "F" => Code::KeyF,
+        "G" => Code::KeyG,
+        "H" => Code::KeyH,
+        "I" => Code::KeyI,
+        "J" => Code::KeyJ,
+        "K" => Code::KeyK,
+        "L" => Code::KeyL,
+        "M" => Code::KeyM,
+        "N" => Code::KeyN,
+        "O" => Code::KeyO,
+        "P" => Code::KeyP,
+        "Q" => Code::KeyQ,
+        "R" => Code::KeyR,
+        "S" => Code::KeyS,
+        "T" => Code::KeyT,
+        "U" => Code::KeyU,
+        "V" => Code::KeyV,
+        "W" => Code::KeyW,
+        "X" => Code::KeyX,
+        "Y" => Code::KeyY,
+        "Z" => Code::KeyZ,
+        "0" => Code::Digit0,
+        "1" => Code::Digit1,
+        "2" => Code::Digit2,
+        "3" => Code::Digit3,
+        "4" => Code::Digit4,
+        "5" => Code::Digit5,
+        "6" => Code::Digit6,
+        "7" => Code::Digit7,
+        "8" => Code::Digit8,
+        "9" => Code::Digit9,
+        "," | "COMMA" => Code::Comma,
+        "." | "PERIOD" => Code::Period,
+        "/" | "SLASH" => Code::Slash,
+        ";" | "SEMICOLON" => Code::Semicolon,
+        "SPACE" => Code::Space,
+        "ENTER" | "RETURN" => Code::Enter,
+        "ESCAPE" | "ESC" => Code::Escape,
+        "BACKSPACE" => Code::Backspace,
+        "TAB" => Code::Tab,
+        "UP" => Code::ArrowUp,
+        "DOWN" => Code::ArrowDown,
+        "LEFT" => Code::ArrowLeft,
+        "RIGHT" => Code::ArrowRight,
+        "DELETE" => Code::Delete,
+        "HOME" => Code::Home,
+        "END" => Code::End,
+        "PAGEUP" => Code::PageUp,
+        "PAGEDOWN" => Code::PageDown,
+        "F1" => Code::F1,
+        "F2" => Code::F2,
+        "F3" => Code::F3,
+        "F4" => Code::F4,
+        "F5" => Code::F5,
+        "F6" => Code::F6,
+        "F7" => Code::F7,
+        "F8" => Code::F8,
+        "F9" => Code::F9,
+        "F10" => Code::F10,
+        "F11" => Code::F11,
+        "F12" => Code::F12,
+        "-" => Code::Minus,
+        "=" => Code::Equal,
+        "[" => Code::BracketLeft,
+        "]" => Code::BracketRight,
+        "\\" => Code::Backslash,
+        "'" => Code::Quote,
+        "`" => Code::Backquote,
+        _ => return Err(format!("Unknown key: {}", key_str)),
+    };
+
+    Ok(Shortcut::new(Some(modifiers), code))
+}
+
+#[tauri::command]
+async fn register_hotkey(
+    app: tauri::AppHandle,
+    action: String,
+    shortcut_str: String,
+    state: State<'_, HotkeyState>,
+) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        let shortcut = parse_shortcut(&shortcut_str).map_err(|e| e.to_string())?;
+        let gs = app.global_shortcut();
+        gs.register(shortcut)
+            .map_err(|e| format!("Failed to register {}: {}", shortcut_str, e))?;
+        state
+            .bindings
+            .lock()
+            .unwrap()
+            .insert(shortcut_str, action);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn unregister_hotkey(
+    app: tauri::AppHandle,
+    shortcut_str: String,
+    state: State<'_, HotkeyState>,
+) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        let shortcut = parse_shortcut(&shortcut_str).map_err(|e| e.to_string())?;
+        let gs = app.global_shortcut();
+        gs.unregister(shortcut)
+            .map_err(|e| format!("Failed to unregister {}: {}", shortcut_str, e))?;
+        state.bindings.lock().unwrap().remove(&shortcut_str);
+    }
+    Ok(())
+}
+
+/// Read the first `head` lines and last `tail` lines of a file efficiently.
+/// Returns { head_lines, tail_lines, mtime_ms }.
+#[tauri::command]
+async fn read_file_head_tail(
+    path: String,
+    head: usize,
+    tail: usize,
+) -> Result<serde_json::Value, String> {
+    use std::fs::File;
+
+    let file = File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
+    let metadata = file.metadata().map_err(|e| format!("Failed to read metadata: {e}"))?;
+    let mtime_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let file_size = metadata.len();
+
+    // Read head lines
+    let mut reader = BufReader::new(&file);
+    let mut head_lines = Vec::with_capacity(head);
+    for _ in 0..head {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => head_lines.push(line.trim_end_matches('\n').trim_end_matches('\r').to_string()),
+            Err(_) => break,
+        }
+    }
+
+    // Read tail lines by scanning backwards from end of file
+    let mut tail_lines = Vec::new();
+    if file_size > 0 && tail > 0 {
+        let mut file_for_tail = File::open(&path).map_err(|e| format!("Failed to reopen: {e}"))?;
+        // Read up to 64KB from the end (enough for ~10 JSONL lines)
+        let chunk_size = std::cmp::min(file_size, 64 * 1024) as usize;
+        let start_pos = file_size - chunk_size as u64;
+        file_for_tail
+            .seek(SeekFrom::Start(start_pos))
+            .map_err(|e| format!("Seek failed: {e}"))?;
+        let mut buf = vec![0u8; chunk_size];
+        file_for_tail
+            .read_exact(&mut buf)
+            .map_err(|e| format!("Read failed: {e}"))?;
+
+        // Split into lines from the end
+        let text = String::from_utf8_lossy(&buf);
+        let all_lines: Vec<&str> = text.lines().collect();
+        // If we seeked into the middle of a line, skip the first partial line
+        let skip = if start_pos > 0 { 1 } else { 0 };
+        let usable = &all_lines[skip.min(all_lines.len())..];
+        let start = if usable.len() > tail {
+            usable.len() - tail
+        } else {
+            0
+        };
+        tail_lines = usable[start..].iter().map(|s| s.to_string()).collect();
+    }
+
+    Ok(serde_json::json!({
+        "headLines": head_lines,
+        "tailLines": tail_lines,
+        "mtimeMs": mtime_ms,
+    }))
+}
+
+/// Read the full text content of a file at any path.
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+/// Open a file or folder with the OS default handler.
+#[tauri::command]
+async fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {path}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Open VSCode at the given directory.
+#[tauri::command]
+async fn resume_session(working_dir: String) -> Result<(), String> {
+    let path = std::path::Path::new(&working_dir);
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("Directory does not exist: {working_dir}"));
+    }
+    std::process::Command::new("code")
+        .arg(&working_dir)
+        .spawn()
+        .map_err(|e| format!("Failed to open VSCode: {e}"))?;
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let hotkey_state = HotkeyState {
+        bindings: Mutex::new(HashMap::new()),
+    };
+
+    // Populate with defaults
+    {
+        let mut map = hotkey_state.bindings.lock().unwrap();
+        map.insert("Ctrl+N".to_string(), "new-note".to_string());
+        map.insert("Ctrl+H".to_string(), "toggle-visibility".to_string());
+        map.insert("Ctrl+Shift+J".to_string(), "toggle-collapse".to_string());
+        map.insert("Ctrl+Shift+D".to_string(), "hide-children".to_string());
+        map.insert("Ctrl+,".to_string(), "opacity-decrease".to_string());
+        map.insert("Ctrl+.".to_string(), "opacity-increase".to_string());
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
         .plugin(tauri_plugin_process::init())
-        .manage(VisibilityState(AtomicBool::new(true)))
+        .plugin(tauri_plugin_dialog::init())
+        .manage(hotkey_state)
+        .invoke_handler(tauri::generate_handler![
+            open_path,
+            read_text_file,
+            resume_session,
+            read_file_head_tail,
+            register_hotkey,
+            unregister_hotkey
+        ])
         .setup(|app| {
             #[cfg(desktop)]
             {
-                use tauri_plugin_global_shortcut::{
-                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
-                };
-
-                // Define shortcuts
-                let new_note = Shortcut::new(Some(Modifiers::CONTROL), Code::KeyN);
-                let toggle_visibility = Shortcut::new(Some(Modifiers::CONTROL), Code::KeyH);
-                let opacity_decrease = Shortcut::new(Some(Modifiers::CONTROL), Code::Comma);
-                let opacity_increase = Shortcut::new(Some(Modifiers::CONTROL), Code::Period);
+                let app_handle = app.handle().clone();
 
                 // Register the plugin with a handler that dispatches based on which shortcut fired
                 app.handle().plugin(
@@ -35,42 +317,45 @@ pub fn run() {
                                 return;
                             }
 
-                            if shortcut == &new_note {
-                                if let Err(e) = app.emit("hotkey:new-note", ()) {
-                                    eprintln!("[hoverpad] failed to emit hotkey:new-note: {e}");
-                                }
-                            } else if shortcut == &toggle_visibility {
-                                toggle_all_windows(app);
-                            } else if shortcut == &opacity_decrease {
-                                if let Err(e) = app.emit("hotkey:opacity-decrease", ()) {
-                                    eprintln!(
-                                        "[hoverpad] failed to emit hotkey:opacity-decrease: {e}"
-                                    );
-                                }
-                            } else if shortcut == &opacity_increase {
-                                if let Err(e) = app.emit("hotkey:opacity-increase", ()) {
-                                    eprintln!(
-                                        "[hoverpad] failed to emit hotkey:opacity-increase: {e}"
-                                    );
+                            let state = app.state::<HotkeyState>();
+                            let bindings = state.bindings.lock().unwrap();
+
+                            // Find which action this shortcut maps to
+                            for (shortcut_str, action) in bindings.iter() {
+                                if let Ok(registered) = parse_shortcut(shortcut_str) {
+                                    if shortcut == &registered {
+                                        let event_name = format!("hotkey:{}", action);
+                                        if let Err(e) = app.emit(&event_name, ()) {
+                                            eprintln!(
+                                                "[hoverpad] failed to emit {}: {e}",
+                                                event_name
+                                            );
+                                        }
+                                        return;
+                                    }
                                 }
                             }
                         })
                         .build(),
                 )?;
 
-                // Register each shortcut individually, logging warnings on failure
-                let gs = app.global_shortcut();
-                if let Err(e) = gs.register(new_note) {
-                    eprintln!("[hoverpad] failed to register Ctrl+N: {e}");
-                }
-                if let Err(e) = gs.register(toggle_visibility) {
-                    eprintln!("[hoverpad] failed to register Ctrl+H: {e}");
-                }
-                if let Err(e) = gs.register(opacity_decrease) {
-                    eprintln!("[hoverpad] failed to register Ctrl+,: {e}");
-                }
-                if let Err(e) = gs.register(opacity_increase) {
-                    eprintln!("[hoverpad] failed to register Ctrl+.: {e}");
+                // Register each default shortcut individually, logging warnings on failure
+                let gs = app_handle.global_shortcut();
+                let default_shortcuts = [
+                    ("Ctrl+N", "new-note"),
+                    ("Ctrl+H", "toggle-visibility"),
+                    ("Ctrl+Shift+J", "toggle-collapse"),
+                    ("Ctrl+Shift+D", "hide-children"),
+                    ("Ctrl+,", "opacity-decrease"),
+                    ("Ctrl+.", "opacity-increase"),
+                ];
+
+                for (shortcut_str, _action) in &default_shortcuts {
+                    if let Ok(shortcut) = parse_shortcut(shortcut_str) {
+                        if let Err(e) = gs.register(shortcut) {
+                            eprintln!("[hoverpad] failed to register {}: {e}", shortcut_str);
+                        }
+                    }
                 }
             }
 
@@ -82,10 +367,13 @@ pub fn run() {
 
             main_window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    // Close all webview windows
-                    for (_, window) in handle.webview_windows() {
-                        let _ = window.close();
+                    // Close all other webview windows, then exit the process
+                    for (label, window) in handle.webview_windows() {
+                        if label != "main" {
+                            let _ = window.destroy();
+                        }
                     }
+                    handle.exit(0);
                 }
             });
 
@@ -93,26 +381,4 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-/// Toggle all webview windows between hidden and shown.
-/// Uses an `AtomicBool` stored in Tauri managed state to track visibility.
-fn toggle_all_windows(app: &tauri::AppHandle) {
-    let state = app.state::<VisibilityState>();
-    let currently_visible = state.0.load(Ordering::SeqCst);
-
-    for (_label, window) in app.webview_windows() {
-        let result = if currently_visible {
-            window.hide()
-        } else {
-            window.show()
-        };
-
-        if let Err(e) = result {
-            eprintln!("[hoverpad] failed to toggle window visibility: {e}");
-        }
-    }
-
-    // Flip the tracked state
-    state.0.store(!currently_visible, Ordering::SeqCst);
 }

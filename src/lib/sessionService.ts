@@ -1,6 +1,32 @@
-import { readDir, readTextFile, exists } from "@tauri-apps/plugin-fs";
+import { readDir, readTextFile, exists, remove } from "@tauri-apps/plugin-fs";
 import { homeDir, join } from "@tauri-apps/api/path";
+import { invoke } from "@tauri-apps/api/core";
 import { getDatabase } from "./database";
+
+// ---------------------------------------------------------------------------
+// Partial file reader (uses Rust command for efficient head/tail reads)
+// ---------------------------------------------------------------------------
+
+interface HeadTailResult {
+  headLines: string[];
+  tailLines: string[];
+  mtimeMs: number;
+}
+
+async function readFileHeadTail(
+  path: string,
+  head: number,
+  tail: number,
+): Promise<HeadTailResult> {
+  return invoke<HeadTailResult>("read_file_head_tail", { path, head, tail });
+}
+
+// ---------------------------------------------------------------------------
+// Mtime cache — skip re-reading files that haven't changed
+// ---------------------------------------------------------------------------
+
+/** Cached session metadata keyed by file path. */
+const sessionCache = new Map<string, { mtimeMs: number; meta: SessionMeta }>();
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,11 +39,21 @@ export interface SessionMeta {
   encodedProjectDir: string;
   startedAt: string;
   endedAt: string | null;
-  status: "active" | "completed" | "errored";
+  status: "active" | "completed" | "idle" | "errored" | "idle-agents" | "inactive";
   workingDir: string | null;
   projectGroupId: string | null;
-  manualGroupId: string | null;
-  ticketId: string | null;
+  manualGroupIds: string[];
+  ticketIds: string[];
+  label: string | null;
+  isOpen: boolean;
+  /** The last user prompt text (truncated), extracted from the log tail. */
+  lastUserMessage: string | null;
+}
+
+export interface FileChangeInfo {
+  filePath: string;
+  linesAdded: number;
+  linesDeleted: number;
 }
 
 export interface SessionEvent {
@@ -26,6 +62,24 @@ export interface SessionEvent {
   sessionId: string;
   toolName?: string;
   summary?: string;
+  /** True when this is a tool result (user event with toolUseResult). */
+  isToolResult?: boolean;
+  /** File change info for Write/Edit/Read tool calls. */
+  fileChanges?: FileChangeInfo[];
+  /** Short file path for display (e.g., `.../kanban/KanbanCard.tsx`). */
+  fileInfo?: string;
+  /** Diff stats string (e.g., `+3/-2` or `+50 lines`). */
+  diffStats?: string;
+  /** Full text content for expandable display. */
+  fullContent?: string;
+  /** True when this is a background agent task-notification. */
+  isTaskNotification?: boolean;
+  /** Claude Code sub-agent ID (maps to subagents/agent-<id>.jsonl). */
+  agentId?: string;
+  /** True when this is the initial prompt sent to a sub-agent. */
+  isAgentPrompt?: boolean;
+  /** Short description for agent prompt display. */
+  agentDescription?: string;
   raw?: unknown;
 }
 
@@ -35,12 +89,15 @@ interface SessionRow {
   pid: number | null;
   started_at: string;
   ended_at: string | null;
-  status: "active" | "completed" | "errored";
+  status: "active" | "completed" | "idle" | "errored" | "idle-agents" | "inactive";
   working_dir: string | null;
   project_group_id: string | null;
   manual_group_id: string | null;
   ticket_id: string | null;
   window_state: string | null;
+  label: string | null;
+  is_open: number;
+  last_user_message: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,10 +206,10 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
 
       const filePath = await join(projectDirPath, file.name);
 
-      // Read the file to extract metadata from the first few lines
-      let fileContent: string;
+      // Read only head + tail lines via Rust (avoids loading entire file)
+      let headTail: HeadTailResult;
       try {
-        fileContent = await readTextFile(filePath);
+        headTail = await readFileHeadTail(filePath, 20, 10);
       } catch (err) {
         console.warn(
           `[sessionService] Failed to read session file ${file.name}:`,
@@ -161,15 +218,29 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
         continue;
       }
 
-      const lines = fileContent.split("\n").filter(Boolean);
-      if (lines.length === 0) continue;
+      // Check mtime cache — skip re-parsing if file hasn't changed.
+      // Only use cache for stable statuses (completed/errored); active/idle
+      // sessions need fresh tail reads because status depends on time elapsed.
+      const cached = sessionCache.get(filePath);
+      if (
+        cached &&
+        cached.mtimeMs === headTail.mtimeMs &&
+        (cached.meta.status === "completed" || cached.meta.status === "errored")
+      ) {
+        sessions.push(cached.meta);
+        continue;
+      }
+
+      const headLines = headTail.headLines;
+      const tailLines = headTail.tailLines;
+      if (headLines.length === 0) continue;
 
       // Find the first entry with a timestamp (skip file-history-snapshot
       // entries that may not have one at the top level)
       let startedAt: string | null = null;
       let workingDir: string | null = null;
 
-      for (const line of lines.slice(0, 20)) {
+      for (const line of headLines) {
         try {
           const entry = JSON.parse(line) as Record<string, unknown>;
           if (entry.timestamp && typeof entry.timestamp === "string") {
@@ -201,29 +272,106 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
 
       if (!startedAt) continue;
 
-      // Determine status: check if the last line is a system turn_duration
-      // (indicates the session completed its last turn) and whether the file
-      // has been inactive. For simplicity, mark all discovered sessions as
-      // "completed" since we can't tell if they're still running from the
-      // file alone. Active detection will be refined later.
+      // Determine status from the last few log entries by checking
+      // concrete signals rather than relying on a time threshold.
       let endedAt: string | null = null;
-      let status: "active" | "completed" | "errored" = "completed";
+      let status: "active" | "completed" | "errored" | "idle" = "completed";
 
-      // Check the last few lines for a system turn_duration or recent timestamp
-      const lastLines = lines.slice(-5);
-      for (let i = lastLines.length - 1; i >= 0; i--) {
+      for (let i = tailLines.length - 1; i >= 0; i--) {
         try {
-          const entry = JSON.parse(lastLines[i]!) as Record<string, unknown>;
-          if (entry.timestamp && typeof entry.timestamp === "string") {
-            endedAt = entry.timestamp;
+          const entry = JSON.parse(tailLines[i]!) as Record<string, unknown>;
+          if (!entry.timestamp || typeof entry.timestamp !== "string") continue;
 
-            // If the last entry is very recent (within 5 minutes), mark as active
-            const lastTime = new Date(entry.timestamp).getTime();
-            const now = Date.now();
-            if (now - lastTime < 5 * 60 * 1000) {
+          const entryTime = new Date(entry.timestamp).getTime();
+          const ageMs = Date.now() - entryTime;
+          const entryType = entry.type as string | undefined;
+
+          // 1) system + turn_duration → the turn finished cleanly
+          if (entryType === "system") {
+            const subtype = entry.subtype as string | undefined;
+            if (subtype === "turn_duration") {
+              status = "completed";
+              endedAt = entry.timestamp;
+              break;
+            }
+          }
+
+          // 2) assistant message → Claude finished responding, waiting for user
+          if (entryType === "assistant") {
+            status = "completed";
+            endedAt = entry.timestamp;
+            break;
+          }
+
+          // 3) progress entry → tool is running; if recent, session is active
+          if (entryType === "progress") {
+            if (ageMs < 15_000) {
               status = "active";
               endedAt = null;
+            } else {
+              // Stale progress — likely interrupted or crashed
+              status = "errored";
+              endedAt = entry.timestamp;
             }
+            break;
+          }
+
+          // 4) user entry (prompt or tool result) — Claude should respond
+          if (entryType === "user") {
+            if (ageMs < 15_000) {
+              status = "active"; // Claude is likely processing
+              endedAt = null;
+            } else {
+              // User sent input but no response followed — idle/stalled
+              status = "idle";
+              endedAt = null;
+            }
+            break;
+          }
+
+          // 5) file-history-snapshot — skip, look at earlier entries
+          if (entryType === "file-history-snapshot") {
+            continue;
+          }
+
+          // Fallback: unknown type with a timestamp
+          endedAt = entry.timestamp;
+          break;
+        } catch {
+          // Skip malformed lines
+        }
+      }
+
+      // Extract last user prompt from tail (skip tool results and meta events)
+      let lastUserMessage: string | null = null;
+      for (let i = tailLines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(tailLines[i]!) as Record<string, unknown>;
+          if (entry.type !== "user") continue;
+          if (entry.toolUseResult) continue;
+          if (entry.isMeta) continue;
+          const message = entry.message as { content?: string | unknown[] } | undefined;
+          if (!message?.content) continue;
+          if (Array.isArray(message.content)) {
+            const hasToolResult = message.content.some(
+              (c) => typeof c === "object" && c !== null && (c as Record<string, unknown>).type === "tool_result",
+            );
+            if (hasToolResult) continue;
+          }
+          const text =
+            typeof message.content === "string"
+              ? message.content
+              : Array.isArray(message.content)
+                ? message.content
+                    .map((c) =>
+                      typeof c === "object" && c !== null && "text" in c
+                        ? (c as { text: string }).text
+                        : "",
+                    )
+                    .join("")
+                : null;
+          if (text && text.trim()) {
+            lastUserMessage = text.trim().slice(0, 200);
             break;
           }
         } catch {
@@ -246,21 +394,65 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
         status,
         workingDir,
         projectGroupId: null,
-        manualGroupId: null,
-        ticketId: null,
+        manualGroupIds: [],
+        ticketIds: [],
+        label: null,
+        isOpen: false,
+        lastUserMessage,
       };
 
-      // Upsert into SQLite
+      // Upsert into SQLite and retrieve existing label
       try {
         const groupId = await ensureProjectGroup(workingDir);
         session.projectGroupId = groupId;
         await upsertSession(session);
+        // Fetch existing user-set fields
+        const db = await getDatabase();
+        const userRows = await db.select<{ label: string | null; is_open: number; last_user_message: string | null }[]>(
+          "SELECT label, is_open, last_user_message FROM sessions WHERE id = $1",
+          [sessionId],
+        );
+        if (userRows.length > 0) {
+          if (userRows[0]!.label) session.label = userRows[0]!.label;
+          session.isOpen = userRows[0]!.is_open === 1;
+          // Use DB value if tail didn't find one (message scrolled out of tail window)
+          if (!session.lastUserMessage && userRows[0]!.last_user_message) {
+            session.lastUserMessage = userRows[0]!.last_user_message;
+          }
+        }
+        // Fetch ticket links from junction table
+        const ticketRows = await db.select<{ ticket_id: string }[]>(
+          "SELECT ticket_id FROM session_tickets WHERE session_id = $1",
+          [sessionId],
+        );
+        session.ticketIds = ticketRows.map((r) => r.ticket_id);
+        // Fetch group memberships from junction table
+        const groupRows = await db.select<{ group_id: string }[]>(
+          "SELECT group_id FROM session_group_members WHERE session_id = $1",
+          [sessionId],
+        );
+        session.manualGroupIds = groupRows.map((r) => r.group_id);
       } catch (err) {
         console.warn(
           `[sessionService] Failed to upsert session ${sessionId}:`,
           err,
         );
       }
+
+      // Derive display status for stale sessions (completed/idle, last activity 30+ min ago)
+      // - Window open → show as "idle"
+      // - Window closed → show as "inactive"
+      const INACTIVE_THRESHOLD_MS = 30 * 60 * 1000;
+      const lastActivity = session.endedAt ?? session.startedAt;
+      if (
+        (session.status === "completed" || session.status === "idle") &&
+        Date.now() - new Date(lastActivity).getTime() > INACTIVE_THRESHOLD_MS
+      ) {
+        session.status = session.isOpen ? "idle" : "inactive";
+      }
+
+      // Cache the result for mtime-based skipping on next poll
+      sessionCache.set(filePath, { mtimeMs: headTail.mtimeMs, meta: session });
 
       sessions.push(session);
     }
@@ -284,13 +476,14 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
 async function upsertSession(session: SessionMeta): Promise<void> {
   const db = await getDatabase();
   await db.execute(
-    `INSERT INTO sessions (id, started_at, ended_at, status, working_dir, project_group_id)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO sessions (id, started_at, ended_at, status, working_dir, project_group_id, last_user_message)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT(id) DO UPDATE SET
        status = $4,
        ended_at = $3,
        working_dir = $5,
-       project_group_id = $6`,
+       project_group_id = $6,
+       last_user_message = COALESCE($7, last_user_message)`,
     [
       session.id,
       session.startedAt,
@@ -298,6 +491,7 @@ async function upsertSession(session: SessionMeta): Promise<void> {
       session.status,
       session.workingDir,
       session.projectGroupId,
+      session.lastUserMessage,
     ],
   );
 }
@@ -334,32 +528,95 @@ export async function listSessions(): Promise<SessionMeta[]> {
     "SELECT * FROM sessions ORDER BY started_at DESC",
   );
 
-  return rows.map((row) => ({
-    id: row.id,
-    sessionId: row.id,
-    projectDir: row.working_dir ?? "",
-    encodedProjectDir: "",
-    startedAt: row.started_at,
-    endedAt: row.ended_at,
-    status: row.status,
-    workingDir: row.working_dir,
-    projectGroupId: row.project_group_id,
-    manualGroupId: row.manual_group_id,
-    ticketId: row.ticket_id,
-  }));
+  // Fetch all group memberships in one query
+  const memberships = await db.select<{ session_id: string; group_id: string }[]>(
+    "SELECT session_id, group_id FROM session_group_members",
+  );
+  const groupsBySession = new Map<string, string[]>();
+  for (const m of memberships) {
+    if (!groupsBySession.has(m.session_id)) groupsBySession.set(m.session_id, []);
+    groupsBySession.get(m.session_id)!.push(m.group_id);
+  }
+
+  // Fetch all ticket links
+  const ticketLinks = await db.select<{ session_id: string; ticket_id: string }[]>(
+    "SELECT session_id, ticket_id FROM session_tickets",
+  );
+  const ticketsBySession = new Map<string, string[]>();
+  for (const tl of ticketLinks) {
+    if (!ticketsBySession.has(tl.session_id)) ticketsBySession.set(tl.session_id, []);
+    ticketsBySession.get(tl.session_id)!.push(tl.ticket_id);
+  }
+
+  const INACTIVE_MS = 30 * 60 * 1000;
+  return rows.map((row) => {
+    const isOpen = row.is_open === 1;
+    const lastActivity = row.ended_at ?? row.started_at;
+    const isStale =
+      (row.status === "completed" || row.status === "idle") &&
+      Date.now() - new Date(lastActivity).getTime() > INACTIVE_MS;
+    return {
+      id: row.id,
+      sessionId: row.id,
+      projectDir: row.working_dir ?? "",
+      encodedProjectDir: "",
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      status: isStale ? (isOpen ? "idle" as const : "inactive" as const) : row.status,
+      workingDir: row.working_dir,
+      projectGroupId: row.project_group_id,
+      manualGroupIds: groupsBySession.get(row.id) || [],
+      ticketIds: ticketsBySession.get(row.id) || [],
+      label: row.label,
+      isOpen,
+      lastUserMessage: row.last_user_message,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Shorten a file path to the last 2 segments. */
+function shortFilePath(filePath: string): string {
+  const parts = filePath.replace(/\\/g, "/").split("/");
+  return parts.length > 2
+    ? `.../${parts.slice(-2).join("/")}`
+    : parts.join("/");
 }
 
 // ---------------------------------------------------------------------------
 // Event parsing
 // ---------------------------------------------------------------------------
 
+/** Detect git/gh CLI commands in a Bash command string. */
+const GIT_COMMAND_RE = /(?:^|[;&|]\s*)(?:git\s+(?:commit|push|add|stage|pr|merge|rebase|cherry-pick|tag|fetch|pull|stash|checkout|switch|branch|diff|log|reset|revert)|gh\s+)/m;
+
+function isGitCommand(cmd: string): boolean {
+  return GIT_COMMAND_RE.test(cmd);
+}
+
 /**
  * Parse a single JSONL line into a `SessionEvent`.
  * Returns `null` if the line is malformed or unrecognised.
+ *
+ * @param toolNameQueue - Optional queue of tool names from preceding assistant
+ *   tool_use blocks. Tool results shift names off this queue to correlate.
  */
+/** Entry in the tool correlation queue — carries file info for tool results. */
+interface ToolQueueEntry {
+  name: string;
+  fileInfo?: string;
+  diffStats?: string;
+  /** Diff content for expandable display on the tool result row. */
+  expandContent?: string;
+}
+
 export function parseSessionEvent(
   line: string,
   sessionId: string,
+  toolNameQueue?: ToolQueueEntry[],
 ): SessionEvent | null {
   try {
     const entry = JSON.parse(line) as Record<string, unknown>;
@@ -386,20 +643,150 @@ export function parseSessionEvent(
       const content = message?.content as unknown[] | undefined;
       if (Array.isArray(content)) {
         // Find tool_use blocks
-        const toolUses = content
-          .filter(
-            (c): c is { type: string; name: string } =>
-              typeof c === "object" &&
-              c !== null &&
-              (c as Record<string, unknown>).type === "tool_use",
-          )
-          .map((c) => c.name);
+        const toolUseBlocks = content.filter(
+          (c): c is { type: string; id?: string; name: string; input?: Record<string, unknown> } =>
+            typeof c === "object" &&
+            c !== null &&
+            (c as Record<string, unknown>).type === "tool_use",
+        );
 
-        if (toolUses.length > 0) {
-          event.toolName = toolUses.join(", ");
-          event.summary = `Tool call: ${toolUses.join(", ")}`;
+        // Build per-block file info for queue + event structured fields
+        const blockInfos: Array<{
+          name: string;
+          fileInfo?: string;
+          diffStats?: string;
+          expandContent?: string;
+          fallbackSummary: string;
+        }> = [];
+
+        for (const block of toolUseBlocks) {
+          const input = block.input;
+          const filePath = input ? ((input.file_path ?? input.path) as string | undefined) : undefined;
+          const info: { name: string; fileInfo?: string; diffStats?: string; expandContent?: string; fallbackSummary: string } = {
+            name: block.name,
+            fallbackSummary: block.name,
+          };
+
+          if (filePath) {
+            info.fileInfo = shortFilePath(filePath);
+            if (block.name === "Write" || block.name === "write") {
+              const writeContent = (input!.content ?? "") as string;
+              const lines = writeContent ? writeContent.split("\n").length : 0;
+              info.diffStats = `+${lines} lines`;
+              info.fallbackSummary = `${info.fileInfo} ${info.diffStats}`;
+            } else if (block.name === "Edit" || block.name === "edit") {
+              const oldStr = (input!.old_string ?? "") as string;
+              const newStr = (input!.new_string ?? "") as string;
+              const oldLines = oldStr ? oldStr.split("\n").length : 0;
+              const newLines = newStr ? newStr.split("\n").length : 0;
+              const parts: string[] = [];
+              if (newLines > 0) parts.push(`+${newLines}`);
+              if (oldLines > 0) parts.push(`-${oldLines}`);
+              info.diffStats = parts.length > 0 ? parts.join("/") : undefined;
+              info.fallbackSummary = `${info.fileInfo}${info.diffStats ? " " + info.diffStats : ""}`;
+              // Build expandable diff content
+              const diffLines: string[] = [];
+              if (oldStr) {
+                for (const line of oldStr.split("\n")) {
+                  diffLines.push(`- ${line}`);
+                }
+              }
+              if (newStr) {
+                for (const line of newStr.split("\n")) {
+                  diffLines.push(`+ ${line}`);
+                }
+              }
+              if (diffLines.length > 0) {
+                info.expandContent = diffLines.join("\n").slice(0, 2000);
+              }
+            } else {
+              info.fallbackSummary = info.fileInfo;
+            }
+          } else if (input && (block.name === "Bash" || block.name === "bash")) {
+            const cmd = (input.command ?? "") as string;
+            if (cmd) {
+              // Show first line of command, truncated
+              const firstLine = cmd.split("\n")[0]!;
+              info.fileInfo = firstLine.length > 80 ? firstLine.slice(0, 77) + "..." : firstLine;
+              info.fallbackSummary = info.fileInfo;
+              // Detect git/gh commands and relabel as "Git"
+              if (isGitCommand(cmd)) {
+                info.name = "Git";
+              }
+            }
+          } else if (input && (block.name === "Grep" || block.name === "grep")) {
+            const pattern = (input.pattern ?? "") as string;
+            if (pattern) {
+              info.fileInfo = pattern;
+              info.fallbackSummary = pattern;
+            }
+          } else if (input && (block.name === "Glob" || block.name === "glob")) {
+            const pattern = (input.pattern ?? "") as string;
+            if (pattern) {
+              info.fileInfo = pattern;
+              info.fallbackSummary = pattern;
+            }
+          } else if (input && (block.name === "Skill" || block.name === "skill")) {
+            const skillName = (input.skill ?? "") as string;
+            if (skillName) {
+              info.fileInfo = skillName;
+              info.fallbackSummary = skillName;
+            }
+          } else if (input && (block.name === "Agent" || block.name === "agent")) {
+            const desc = (input.description ?? "") as string;
+            const prompt = (input.prompt ?? "") as string;
+            if (desc) {
+              info.fileInfo = desc;
+              info.fallbackSummary = desc;
+            }
+            if (prompt) {
+              info.expandContent = prompt.slice(0, 3000);
+            }
+          } else if (input && (block.name === "Task" || block.name === "task")) {
+            const desc = (input.description ?? "") as string;
+            if (desc) {
+              info.fileInfo = desc;
+              info.fallbackSummary = desc;
+            }
+          }
+          blockInfos.push(info);
+        }
+
+        // Push to queue for correlation with tool results
+        // (skip Agent — its result is matched by agentId, not FIFO queue)
+        if (toolNameQueue) {
+          for (const info of blockInfos) {
+            if (info.name === "Agent" || info.name === "agent") continue;
+            toolNameQueue.push({ name: info.name, fileInfo: info.fileInfo, diffStats: info.diffStats, expandContent: info.expandContent });
+          }
+        }
+
+        if (blockInfos.length > 0) {
+          if (blockInfos.length === 1) {
+            const info = blockInfos[0]!;
+            event.toolName = info.name;
+            event.fileInfo = info.fileInfo;
+            event.diffStats = info.diffStats;
+            if (!info.fileInfo) {
+              event.summary = info.fallbackSummary;
+            } else {
+              event.summary = "started";
+            }
+          } else {
+            event.toolName = blockInfos.map(i => i.name).join(", ");
+            event.summary = blockInfos.map(i => i.fallbackSummary).join(" · ");
+          }
+
+          // Capture any text content from the same message (AI explanation alongside tool calls)
+          const mixedTextBlocks = content.filter(
+            (c): c is { type: string; text: string } =>
+              typeof c === "object" && c !== null && (c as Record<string, unknown>).type === "text",
+          );
+          if (mixedTextBlocks.length > 0) {
+            event.fullContent = mixedTextBlocks.map((b) => b.text).join("\n");
+          }
         } else {
-          // Check for text content
+          // Pure text content (AI response without tool calls)
           const textBlocks = content.filter(
             (c): c is { type: string; text: string } =>
               typeof c === "object" &&
@@ -408,9 +795,13 @@ export function parseSessionEvent(
           );
           if (textBlocks.length > 0) {
             const text = textBlocks.map((b) => b.text).join(" ");
-            event.summary = text.slice(0, 100);
+            if (!text.trim()) return null; // Skip empty text responses
+            event.summary = "responded";
+            // Full text available on expand
+            event.fullContent = text;
           } else {
-            event.summary = "Response";
+            // No text content (e.g., thinking-only response) — skip
+            return null;
           }
         }
       }
@@ -419,29 +810,144 @@ export function parseSessionEvent(
         | { content?: string | unknown[] }
         | undefined;
       const toolUseResult = entry.toolUseResult as
-        | { interrupted?: boolean }
+        | { interrupted?: boolean; content?: string | unknown[]; agentId?: string }
         | undefined;
+      const isMeta = entry.isMeta === true;
 
-      if (toolUseResult) {
-        event.summary = `Tool result (${toolUseResult.interrupted ? "interrupted" : "completed"})`;
+      // Also detect tool_result blocks inside message.content arrays
+      const contentArray = Array.isArray(message?.content) ? message!.content as unknown[] : null;
+      const toolResultBlock = contentArray?.find(
+        (c): c is { type: string; tool_use_id: string; content?: string } =>
+          typeof c === "object" && c !== null && (c as Record<string, unknown>).type === "tool_result",
+      );
+
+      if (toolUseResult || toolResultBlock) {
+        event.isToolResult = true;
+
+        // Agent results have agentId — they DON'T use the FIFO queue because
+        // the agent runs many tool calls between spawn and result.
+        if (toolUseResult?.agentId) {
+          event.toolName = "Agent";
+          event.agentId = toolUseResult.agentId as string;
+          event.summary = "completed";
+          // Extract description from prompt field
+          const prompt = (toolUseResult as Record<string, unknown>).prompt as string | undefined;
+          if (prompt) {
+            event.fullContent = prompt.slice(0, 3000);
+          }
+          // Extract result text for display
+          let resultText: string | undefined;
+          if (Array.isArray(toolUseResult.content)) {
+            resultText = toolUseResult.content
+              .filter((c): c is { type: string; text: string } =>
+                typeof c === "object" && c !== null && (c as Record<string, unknown>).type === "text")
+              .map((c) => c.text)
+              .join("\n");
+          } else if (typeof toolUseResult.content === "string") {
+            resultText = toolUseResult.content;
+          }
+          if (resultText) {
+            // Use agent output as summary snippet, keep prompt as expandable
+            event.fileInfo = resultText.slice(0, 100);
+          }
+        } else {
+          // Normal tool result — pop from FIFO queue
+          if (toolNameQueue && toolNameQueue.length > 0) {
+            const entry = toolNameQueue.shift()!;
+            event.toolName = entry.name;
+            event.fileInfo = entry.fileInfo;
+            event.diffStats = entry.diffStats;
+            if (entry.expandContent) {
+              event.fullContent = entry.expandContent;
+            }
+          }
+          event.summary = toolUseResult?.interrupted ? "interrupted" : "completed";
+          // Use result content for expandable display
+          let resultText: string | undefined;
+          if (toolUseResult?.content) {
+            if (typeof toolUseResult.content === "string") {
+              resultText = toolUseResult.content;
+            } else if (Array.isArray(toolUseResult.content)) {
+              resultText = toolUseResult.content
+                .filter((c): c is { type: string; text: string } =>
+                  typeof c === "object" && c !== null && (c as Record<string, unknown>).type === "text")
+                .map((c) => c.text)
+                .join("\n");
+            }
+          }
+          if (!resultText && typeof toolResultBlock?.content === "string") {
+            resultText = toolResultBlock.content;
+          }
+          if (!event.fullContent && resultText && resultText.length > 0) {
+            event.fullContent = resultText.slice(0, 500);
+          }
+        }
       } else if (message?.content) {
         const text =
           typeof message.content === "string"
             ? message.content
-            : "User input";
-        event.summary = text.slice(0, 100);
+            : Array.isArray(message.content)
+              ? message.content
+                  .map((c) =>
+                    typeof c === "object" && c !== null && "text" in c
+                      ? (c as { text: string }).text
+                      : "",
+                  )
+                  .join("")
+              : "User input";
+
+        if (isMeta) {
+          // System-injected content (e.g., expanded skill prompt) — absorb into current group
+          event.isToolResult = true; // prevents starting a new group
+          event.toolName = "Skill";
+          event.summary = "skill loaded";
+          if (text.length > 0) {
+            event.fullContent = text.slice(0, 2000);
+          }
+        } else if (text.includes("<task-notification>")) {
+          // Background agent completion — mark as task notification
+          event.isTaskNotification = true;
+          event.isToolResult = true; // prevents starting a new group
+          event.toolName = "TaskNotification";
+          // Try to extract a clean summary from the notification content
+          const resultMatch = text.match(
+            /<(?:result|stdout)>([\s\S]*?)<\/(?:result|stdout)>/,
+          );
+          if (resultMatch?.[1]?.trim()) {
+            event.summary = resultMatch[1].trim().slice(0, 150);
+          } else {
+            // Fallback: extract text after the closing tags
+            const afterTags = text
+              .replace(/<[^>]+>/g, " ")
+              .replace(/\s+/g, " ")
+              .trim();
+            event.summary = afterTags
+              ? afterTags.slice(0, 150)
+              : "Agent completed";
+          }
+          event.fullContent = text;
+        } else {
+          if (!text.trim()) return null; // Skip empty user messages
+          event.summary = text.slice(0, 100);
+          if (
+            typeof message.content === "string" &&
+            message.content.length > 100
+          ) {
+            event.fullContent = message.content;
+          }
+        }
       }
     } else if (type === "progress") {
-      const data = entry.data as { type?: string } | undefined;
-      event.summary = `Progress: ${data?.type || "update"}`;
-      event.toolName = entry.parentToolUseID as string | undefined;
+      // Skip all progress events — they add noise without useful info
+      return null;
     } else if (type === "system") {
       const subtype = entry.subtype as string | undefined;
       const durationMs = entry.durationMs as number | undefined;
       if (subtype === "turn_duration" && durationMs !== undefined) {
         event.summary = `Turn completed (${Math.round(durationMs / 1000)}s)`;
       } else {
-        event.summary = "System event";
+        // Skip vague system events — only keep turn_duration
+        return null;
       }
     } else if (type === "file-history-snapshot") {
       event.summary = "File snapshot";
@@ -521,9 +1027,12 @@ export async function startTailing(
   const lines = content.split("\n").filter(Boolean);
   let lastProgressEmit = 0;
 
+  // Queue to correlate tool info across events (assistant tool_use → user tool result)
+  const toolNameQueue: ToolQueueEntry[] = [];
+
   // Process existing lines (initial load)
   for (const line of lines) {
-    const event = parseSessionEvent(line, sessionId);
+    const event = parseSessionEvent(line, sessionId, toolNameQueue);
     if (!event) continue;
 
     // Throttle progress events during initial load too
@@ -555,7 +1064,7 @@ export async function startTailing(
       state.lastLineCount = newLines.length;
 
       for (const line of freshLines) {
-        const event = parseSessionEvent(line, sessionId);
+        const event = parseSessionEvent(line, sessionId, toolNameQueue);
         if (!event) continue;
 
         // Throttle progress events to ~1 per second
@@ -570,7 +1079,7 @@ export async function startTailing(
     } catch (err) {
       console.warn(`[sessionService] Tailing poll error for ${sessionId}:`, err);
     }
-  }, 2000);
+  }, 500);
 
   tailingState.set(sessionId, state);
 }
@@ -600,4 +1109,567 @@ export function stopAllTailing(): void {
  */
 export function listActiveTails(): string[] {
   return Array.from(tailingState.keys());
+}
+
+// ---------------------------------------------------------------------------
+// Sub-agent tailing
+// ---------------------------------------------------------------------------
+
+/**
+ * Discover sub-agent IDs by listing files in the subagents/ directory.
+ * Returns an array of agentId strings (extracted from filenames like `agent-<id>.jsonl`),
+ * sorted by file modification time (oldest first).
+ */
+export async function discoverSubagentIds(
+  sessionId: string,
+  encodedProjectDir: string,
+): Promise<string[]> {
+  const home = await homeDir();
+  const dir = await join(
+    home,
+    ".claude",
+    "projects",
+    encodedProjectDir,
+    sessionId,
+    "subagents",
+  );
+
+  if (!(await exists(dir))) return [];
+
+  try {
+    const entries = await readDir(dir);
+    return entries
+      .filter((e) => e.name?.startsWith("agent-") && e.name?.endsWith(".jsonl"))
+      .map((e) => e.name!.replace("agent-", "").replace(".jsonl", ""))
+      .sort(); // Lexicographic sort — UUIDs are ordered by creation time
+  } catch {
+    return [];
+  }
+}
+
+/** Map of agentId -> tailing state for active sub-agent tails. */
+const agentTailState = new Map<string, TailState>();
+
+/**
+ * Start tailing a sub-agent's JSONL log file. Same approach as `startTailing`
+ * but reads from `subagents/agent-{agentId}.jsonl` within the session directory.
+ */
+export async function startAgentTailing(
+  sessionId: string,
+  encodedProjectDir: string,
+  agentId: string,
+  onEvent: (event: SessionEvent) => void,
+  agentDescription?: string,
+): Promise<void> {
+  if (agentTailState.has(agentId)) return;
+
+  const home = await homeDir();
+  const filePath = await join(
+    home,
+    ".claude",
+    "projects",
+    encodedProjectDir,
+    sessionId,
+    "subagents",
+    `agent-${agentId}.jsonl`,
+  );
+
+  const fileExists = await exists(filePath);
+  if (!fileExists) {
+    console.warn(`[sessionService] Sub-agent file does not exist: ${filePath}`);
+    return;
+  }
+
+  let content: string;
+  try {
+    content = await readTextFile(filePath);
+  } catch (err) {
+    console.warn(`[sessionService] Failed to read sub-agent file:`, err);
+    return;
+  }
+
+  const lines = content.split("\n").filter(Boolean);
+  let lastProgressEmit = 0;
+  let firstUserSeen = false;
+  const toolNameQueue: ToolQueueEntry[] = [];
+
+  for (const line of lines) {
+    const event = parseSessionEvent(line, sessionId, toolNameQueue);
+    if (!event) continue;
+    // Mark the first user message as the agent prompt
+    if (!firstUserSeen && event.type === "user" && !event.isToolResult) {
+      firstUserSeen = true;
+      event.isAgentPrompt = true;
+      event.agentDescription = agentDescription;
+    }
+    if (event.type === "progress") {
+      const eventTime = new Date(event.timestamp).getTime();
+      if (eventTime - lastProgressEmit < 1000) continue;
+      lastProgressEmit = eventTime;
+    }
+    onEvent(event);
+  }
+
+  const state: TailState = {
+    intervalId: 0 as unknown as ReturnType<typeof setInterval>,
+    lastLineCount: lines.length,
+    lastProgressEmit,
+  };
+
+  state.intervalId = setInterval(async () => {
+    try {
+      const newContent = await readTextFile(filePath);
+      const newLines = newContent.split("\n").filter(Boolean);
+      if (newLines.length <= state.lastLineCount) return;
+
+      const freshLines = newLines.slice(state.lastLineCount);
+      state.lastLineCount = newLines.length;
+
+      for (const line of freshLines) {
+        const event = parseSessionEvent(line, sessionId, toolNameQueue);
+        if (!event) continue;
+        if (event.type === "progress") {
+          const now = Date.now();
+          if (now - state.lastProgressEmit < 1000) continue;
+          state.lastProgressEmit = now;
+        }
+        onEvent(event);
+      }
+    } catch (err) {
+      console.warn(`[sessionService] Agent tailing poll error for ${agentId}:`, err);
+    }
+  }, 500);
+
+  agentTailState.set(agentId, state);
+}
+
+/**
+ * Stop tailing a sub-agent's log file.
+ */
+export function stopAgentTailing(agentId: string): void {
+  const state = agentTailState.get(agentId);
+  if (state) {
+    clearInterval(state.intervalId);
+    agentTailState.delete(agentId);
+  }
+}
+
+/**
+ * Stop all active sub-agent tails.
+ */
+export function stopAllAgentTailing(): void {
+  for (const [agentId] of agentTailState) {
+    stopAgentTailing(agentId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session ↔ Ticket linking
+// ---------------------------------------------------------------------------
+
+/**
+ * Link a session to a ticket (many-to-many via junction table).
+ */
+export async function linkSessionToTicket(
+  sessionId: string,
+  ticketId: string,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute(
+    "INSERT OR IGNORE INTO session_tickets (session_id, ticket_id) VALUES ($1, $2)",
+    [sessionId, ticketId],
+  );
+}
+
+/**
+ * Unlink a session from a specific ticket.
+ */
+export async function unlinkSession(sessionId: string, ticketId: string): Promise<void> {
+  const db = await getDatabase();
+  await db.execute(
+    "DELETE FROM session_tickets WHERE session_id = $1 AND ticket_id = $2",
+    [sessionId, ticketId],
+  );
+}
+
+/**
+ * Get all sessions linked to a specific ticket.
+ */
+export async function getSessionsForTicket(
+  ticketId: string,
+): Promise<SessionMeta[]> {
+  const db = await getDatabase();
+  const rows = await db.select<SessionRow[]>(
+    `SELECT s.* FROM sessions s
+     JOIN session_tickets st ON st.session_id = s.id
+     WHERE st.ticket_id = $1
+     ORDER BY s.started_at DESC`,
+    [ticketId],
+  );
+
+  const sessionIds = rows.map((r) => r.id);
+  const memberships = sessionIds.length > 0
+    ? await db.select<{ session_id: string; group_id: string }[]>(
+        `SELECT session_id, group_id FROM session_group_members WHERE session_id IN (${sessionIds.map((_, i) => `$${i + 1}`).join(",")})`,
+        sessionIds,
+      )
+    : [];
+  const groupsBySession = new Map<string, string[]>();
+  for (const m of memberships) {
+    if (!groupsBySession.has(m.session_id)) groupsBySession.set(m.session_id, []);
+    groupsBySession.get(m.session_id)!.push(m.group_id);
+  }
+
+  // Fetch ticket links for these sessions
+  const ticketLinks = sessionIds.length > 0
+    ? await db.select<{ session_id: string; ticket_id: string }[]>(
+        `SELECT session_id, ticket_id FROM session_tickets WHERE session_id IN (${sessionIds.map((_, i) => `$${i + 1}`).join(",")})`,
+        sessionIds,
+      )
+    : [];
+  const ticketsBySession = new Map<string, string[]>();
+  for (const tl of ticketLinks) {
+    if (!ticketsBySession.has(tl.session_id)) ticketsBySession.set(tl.session_id, []);
+    ticketsBySession.get(tl.session_id)!.push(tl.ticket_id);
+  }
+
+  const INACTIVE_MS = 30 * 60 * 1000;
+  return rows.map((row) => {
+    const isOpen = row.is_open === 1;
+    const lastActivity = row.ended_at ?? row.started_at;
+    const isStale =
+      (row.status === "completed" || row.status === "idle") &&
+      Date.now() - new Date(lastActivity).getTime() > INACTIVE_MS;
+    return {
+      id: row.id,
+      sessionId: row.id,
+      projectDir: row.working_dir ?? "",
+      encodedProjectDir: "",
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      status: isStale ? (isOpen ? "idle" as const : "inactive" as const) : row.status,
+      workingDir: row.working_dir,
+      projectGroupId: row.project_group_id,
+      manualGroupIds: groupsBySession.get(row.id) || [],
+      ticketIds: ticketsBySession.get(row.id) || [],
+      label: row.label,
+      isOpen,
+      lastUserMessage: row.last_user_message,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Session renaming
+// ---------------------------------------------------------------------------
+
+/**
+ * Set a user-defined label for a session.
+ * Pass `null` to clear the label.
+ */
+export async function renameSession(
+  sessionId: string,
+  label: string | null,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute("UPDATE sessions SET label = $1 WHERE id = $2", [
+    label,
+    sessionId,
+  ]);
+}
+
+/**
+ * Update the is_open flag for a session in SQLite.
+ */
+export async function setSessionOpen(
+  sessionId: string,
+  isOpen: boolean,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute("UPDATE sessions SET is_open = $1 WHERE id = $2", [
+    isOpen ? 1 : 0,
+    sessionId,
+  ]);
+}
+
+export async function setSessionGroupOpen(
+  groupId: string,
+  isOpen: boolean,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute("UPDATE session_groups SET is_open = $1 WHERE id = $2", [
+    isOpen ? 1 : 0,
+    groupId,
+  ]);
+}
+
+export async function getSessionGroupIdForProject(
+  projectDir: string,
+): Promise<string | null> {
+  const db = await getDatabase();
+  const rows = await db.select<{ id: string }[]>(
+    "SELECT id FROM session_groups WHERE group_type = 'project' AND project_dir = $1",
+    [projectDir],
+  );
+  return rows.length > 0 ? rows[0]!.id : null;
+}
+
+export async function listOpenSessionGroups(): Promise<SessionGroup[]> {
+  const db = await getDatabase();
+  const rows = await db.select<{
+    id: string;
+    name: string;
+    group_type: string;
+    project_dir: string | null;
+    sort_order: number;
+    created_at: string;
+  }[]>("SELECT id, name, group_type, project_dir, sort_order, created_at FROM session_groups WHERE is_open = 1");
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    groupType: r.group_type as "project" | "manual",
+    projectDir: r.project_dir,
+    sortOrder: r.sort_order,
+    createdAt: r.created_at,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Session log deletion
+// ---------------------------------------------------------------------------
+
+/** Build the absolute path to a session's JSONL log file. */
+export async function getSessionLogPath(
+  sessionId: string,
+  encodedProjectDir: string,
+): Promise<string> {
+  const home = await homeDir();
+  return join(home, ".claude", "projects", encodedProjectDir, `${sessionId}.jsonl`);
+}
+
+/**
+ * Delete a single session's JSONL log file and remove it from SQLite.
+ */
+export async function deleteSession(
+  sessionId: string,
+  encodedProjectDir: string,
+): Promise<void> {
+  const home = await homeDir();
+  const filePath = await join(
+    home, ".claude", "projects", encodedProjectDir, `${sessionId}.jsonl`,
+  );
+  try {
+    const fileExists = await exists(filePath);
+    if (fileExists) await remove(filePath);
+  } catch (err) {
+    console.warn(`[sessionService] Failed to delete log file for ${sessionId}:`, err);
+  }
+  try {
+    const db = await getDatabase();
+    await db.execute("DELETE FROM session_events WHERE session_id = $1", [sessionId]);
+    await db.execute("DELETE FROM sessions WHERE id = $1", [sessionId]);
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * Delete all JSONL log files for a specific encoded project directory.
+ * Also removes the corresponding sessions from SQLite.
+ */
+export async function deleteProjectSessions(
+  encodedProjectDir: string,
+): Promise<void> {
+  const home = await homeDir();
+  const projectDirPath = await join(home, ".claude", "projects", encodedProjectDir);
+
+  const dirExists = await exists(projectDirPath);
+  if (!dirExists) return;
+
+  let files: Awaited<ReturnType<typeof readDir>>;
+  try {
+    files = await readDir(projectDirPath);
+  } catch {
+    return;
+  }
+
+  const jsonlFiles = files.filter(
+    (f) => !f.isDirectory && f.name.endsWith(".jsonl"),
+  );
+
+  for (const file of jsonlFiles) {
+    const filePath = await join(projectDirPath, file.name);
+    try {
+      await remove(filePath);
+    } catch (err) {
+      console.warn(`[sessionService] Failed to delete ${file.name}:`, err);
+    }
+
+    // Remove from SQLite
+    const sessionId = file.name.replace(/\.jsonl$/, "");
+    try {
+      const db = await getDatabase();
+      await db.execute("DELETE FROM session_events WHERE session_id = $1", [sessionId]);
+      await db.execute("DELETE FROM sessions WHERE id = $1", [sessionId]);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+/**
+ * Delete all JSONL log files across all projects.
+ * Also removes all sessions from SQLite.
+ */
+export async function deleteAllSessions(): Promise<void> {
+  const home = await homeDir();
+  const projectsPath = await join(home, ".claude", "projects");
+
+  const dirExists = await exists(projectsPath);
+  if (!dirExists) return;
+
+  let projectDirs: Awaited<ReturnType<typeof readDir>>;
+  try {
+    projectDirs = await readDir(projectsPath);
+  } catch {
+    return;
+  }
+
+  for (const entry of projectDirs) {
+    if (!entry.isDirectory) continue;
+    await deleteProjectSessions(entry.name);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Path display helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert an absolute path to a home-relative path (e.g., `~/Projects/ai/hoverpad`).
+ */
+export function toHomeRelativePath(
+  absolutePath: string,
+  homePath: string,
+): string {
+  const normAbs = absolutePath.replace(/\\/g, "/");
+  const normHome = homePath.replace(/\\/g, "/").replace(/\/$/, "");
+
+  if (normAbs.startsWith(normHome)) {
+    const relative = normAbs.slice(normHome.length);
+    return "~" + relative;
+  }
+  return absolutePath;
+}
+
+// ---------------------------------------------------------------------------
+// Custom session groups
+// ---------------------------------------------------------------------------
+
+export interface SessionGroup {
+  id: string;
+  name: string;
+  groupType: "project" | "manual";
+  projectDir: string | null;
+  createdAt: string;
+  sortOrder: number;
+}
+
+/**
+ * List all manual (user-created) session groups.
+ */
+export async function listManualGroups(): Promise<SessionGroup[]> {
+  const db = await getDatabase();
+  const rows = await db.select<
+    { id: string; name: string; group_type: string; project_dir: string | null; created_at: string; sort_order: number }[]
+  >("SELECT * FROM session_groups WHERE group_type = 'manual' ORDER BY sort_order ASC, created_at DESC");
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    groupType: r.group_type as "manual",
+    projectDir: r.project_dir,
+    createdAt: r.created_at,
+    sortOrder: r.sort_order ?? 0,
+  }));
+}
+
+/**
+ * Create a new manual session group.
+ */
+export async function createManualGroup(name: string): Promise<string> {
+  const db = await getDatabase();
+  const id = crypto.randomUUID();
+  await db.execute(
+    "INSERT INTO session_groups (id, name, group_type) VALUES ($1, $2, 'manual')",
+    [id, name],
+  );
+  return id;
+}
+
+/**
+ * Rename a manual session group.
+ */
+export async function renameManualGroup(
+  groupId: string,
+  name: string,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute("UPDATE session_groups SET name = $1 WHERE id = $2", [name, groupId]);
+}
+
+/**
+ * Delete a manual session group. Removes memberships (cascade) and the group row.
+ */
+export async function deleteManualGroup(groupId: string): Promise<void> {
+  const db = await getDatabase();
+  await db.execute("DELETE FROM session_group_members WHERE group_id = $1", [groupId]);
+  await db.execute("DELETE FROM session_groups WHERE id = $1", [groupId]);
+}
+
+/**
+ * Reorder manual groups. Accepts the full ordered list of group IDs.
+ */
+export async function reorderManualGroups(orderedIds: string[]): Promise<void> {
+  const db = await getDatabase();
+  for (let i = 0; i < orderedIds.length; i++) {
+    await db.execute("UPDATE session_groups SET sort_order = $1 WHERE id = $2", [i, orderedIds[i]]);
+  }
+}
+
+/**
+ * Add a session to a manual group. No-op if already a member.
+ */
+export async function addSessionToGroup(
+  sessionId: string,
+  groupId: string,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute(
+    "INSERT OR IGNORE INTO session_group_members (session_id, group_id) VALUES ($1, $2)",
+    [sessionId, groupId],
+  );
+}
+
+/**
+ * Remove a session from a manual group.
+ */
+export async function removeSessionFromGroup(
+  sessionId: string,
+  groupId: string,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute(
+    "DELETE FROM session_group_members WHERE session_id = $1 AND group_id = $2",
+    [sessionId, groupId],
+  );
+}
+
+/**
+ * Remove a session from all manual groups.
+ */
+export async function removeSessionFromAllGroups(
+  sessionId: string,
+): Promise<void> {
+  const db = await getDatabase();
+  await db.execute("DELETE FROM session_group_members WHERE session_id = $1", [sessionId]);
 }

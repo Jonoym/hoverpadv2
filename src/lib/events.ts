@@ -5,11 +5,14 @@ import type { SessionEvent } from "./sessionService";
  * Typed event payloads for cross-window communication.
  */
 export interface HoverpadEventMap {
-  "window:opened": { label: string; windowType: "note" | "session" };
-  "window:closed": { label: string; windowType: "note" | "session" };
+  "window:opened": { label: string; windowType: "note" | "session" | "session-group" | "logfile" };
+  "window:closed": { label: string; windowType: "note" | "session" | "session-group" | "logfile" };
+  "window:flash": { label: string; color?: string };
   "test:ping": { from: string; message: string };
   "session:event": { sessionId: string; event: SessionEvent };
   "session:status": { sessionId: string; status: "active" | "completed" | "errored" };
+  "note:renamed": { noteId: string; newTitle: string };
+  "session:renamed": { sessionId: string; newLabel: string | null };
 }
 
 export type HoverpadEventName = keyof HoverpadEventMap;

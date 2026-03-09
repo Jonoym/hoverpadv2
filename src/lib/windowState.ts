@@ -24,7 +24,7 @@ export interface WindowState {
  */
 export async function saveWindowState(
   id: string,
-  table: "notes" | "sessions",
+  table: "notes" | "sessions" | "log_files" | "session_groups",
 ): Promise<void> {
   const appWindow = getCurrentWebviewWindow();
   const pos = await appWindow.outerPosition();
@@ -50,7 +50,7 @@ export async function saveWindowState(
  */
 export async function loadWindowState(
   id: string,
-  table: "notes" | "sessions",
+  table: "notes" | "sessions" | "log_files" | "session_groups",
 ): Promise<WindowState | null> {
   const db = await getDatabase();
   const rows = await db.select<{ window_state: string | null }[]>(
@@ -82,7 +82,7 @@ const SAVE_DEBOUNCE_MS = 2000;
  */
 export function useWindowStateSaver(
   id: string | undefined,
-  table: "notes" | "sessions",
+  table: "notes" | "sessions" | "log_files" | "session_groups",
 ): void {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -103,6 +103,8 @@ export function useWindowStateSaver(
 
     return () => {
       clearTimeout(debounceRef.current);
+      // Force an immediate save on unmount (window closing) so state isn't lost
+      saveWindowState(id, table).catch(console.error);
       unlistenMove.then((fn) => fn()).catch(console.error);
       unlistenResize.then((fn) => fn()).catch(console.error);
     };

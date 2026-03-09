@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capability for all windows",
-  "windows": ["main", "note-*", "session-*"],
+  "windows": ["main", "note-*", "session-*", "sg-*", "logfile-*"],
   "permissions": [
     "core:default",
     "core:window:allow-create",
@@ -66,7 +66,8 @@
     {
       "identifier": "fs:allow-remove",
       "allow": [
-        { "path": "$HOME/hoverpad/**" }
+        { "path": "$HOME/hoverpad/**" },
+        { "path": "$HOME/.claude/projects/**" }
       ]
     },
     {
@@ -75,6 +76,7 @@
         { "path": "$HOME/hoverpad/**" }
       ]
     },
+    "dialog:default",
     "process:default",
     "core:window:allow-set-size",
     "core:window:allow-set-position",
@@ -84,6 +86,8 @@
     "core:window:allow-outer-position",
     "core:window:allow-set-always-on-top",
     "core:window:allow-current-monitor",
-    "core:window:allow-set-ignore-cursor-events"
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-skip-taskbar"
   ]
 }

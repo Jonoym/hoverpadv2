@@ -143,6 +143,17 @@ body {
   background: oklch(0.5 0 0 / 0.5);
 }
 
+/* Global find-in-page highlights (CSS Custom Highlight API) */
+::highlight(FindBarAll) {
+  background-color: oklch(0.45 0.15 260); /* muted blue */
+  color: oklch(0.95 0 0);
+}
+
+::highlight(FindBarCurrent) {
+  background-color: oklch(0.6 0.2 260); /* bright blue for active match */
+  color: oklch(0.98 0 0);
+}
+
 @layer base {
   * {
     @apply border-border;

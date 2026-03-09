@@ -16,5 +16,9 @@
       "Bash(timeout 30 npm run:*)",
       "Bash(taskkill:*)"
     ]
+  },
+  "enabledPlugins": {
+    "context7@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true
   }
 }

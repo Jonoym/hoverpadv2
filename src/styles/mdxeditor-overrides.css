@@ -43,8 +43,10 @@
   -webkit-user-select: text;
 }
 
-/* Ensure the editor fills available space with proper flex layout */
-.dark-theme.mdxeditor > div {
+/* Ensure the editor content wrapper fills available space with proper flex layout.
+   IMPORTANT: Exclude .mdxeditor-toolbar — it's also a direct child div, and
+   setting flex-direction: column on it breaks its horizontal button row. */
+.dark-theme.mdxeditor > div:not(.mdxeditor-toolbar) {
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -57,38 +59,74 @@
   overflow-y: auto;
 }
 
-/* Toolbar styling */
+/* Fill the editor to the bottom of the window.
+   Titlebar ~2.25rem + toolbar ~2.25rem + padding ~0.5rem ≈ 5rem */
+.dark-theme [role="textbox"] {
+  min-height: calc(100vh - 6.5rem);
+  cursor: text;
+}
+
+/* Toolbar styling — slim rounded bar matching app chrome */
 .dark-theme .mdxeditor-toolbar {
-  background: oklch(0.205 0 0);
-  border-color: oklch(0.3 0 0);
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+  overflow-x: auto;
+  background: rgb(38 38 38 / 0.4);
+  border: 1px solid rgb(64 64 64 / 0.3);
   border-radius: 0.5rem;
-  gap: 2px;
+  gap: 0;
+  padding: 0.35rem 0.5rem;
+  margin: 0.15rem 0.25rem;
+}
+
+/* Toolbar separator */
+.dark-theme .mdxeditor-toolbar [class*="separator"],
+.dark-theme .mdxeditor-toolbar [role="separator"] {
+  background: oklch(0.3 0 0);
+  width: 1px;
+  height: 1.2rem;
+  margin: 0 0.3rem;
 }
 
 /* Toolbar buttons */
 .dark-theme .mdxeditor-toolbar button,
 .dark-theme .mdxeditor-toolbar [role="button"] {
-  color: oklch(0.75 0 0);
+  color: oklch(0.6 0 0);
+  border-radius: 0.25rem;
+  padding: 0.3rem 0.4rem;
+  min-height: unset;
+  min-width: unset;
 }
 
 .dark-theme .mdxeditor-toolbar button:hover,
 .dark-theme .mdxeditor-toolbar [role="button"]:hover {
-  background: oklch(0.3 0 0);
-  color: oklch(0.92 0 0);
+  background: rgb(64 64 64 / 0.5);
+  color: oklch(0.85 0 0);
 }
 
 .dark-theme .mdxeditor-toolbar button[data-state="on"],
 .dark-theme .mdxeditor-toolbar [role="button"][data-state="on"] {
-  background: oklch(0.35 0 0);
-  color: oklch(0.985 0 0);
+  background: rgb(64 64 64 / 0.5);
+  color: oklch(0.92 0 0);
+}
+
+/* Toolbar button icons — smaller */
+.dark-theme .mdxeditor-toolbar button svg,
+.dark-theme .mdxeditor-toolbar [role="button"] svg {
+  width: 15px;
+  height: 15px;
 }
 
 /* Select / dropdown triggers inside toolbar */
 .dark-theme .mdxeditor-toolbar select,
 .dark-theme .mdxeditor-toolbar [role="combobox"] {
-  background: oklch(0.25 0 0);
-  color: oklch(0.85 0 0);
-  border-color: oklch(0.35 0 0);
+  background: oklch(0.2 0 0);
+  color: oklch(0.75 0 0);
+  border-color: oklch(0.3 0 0);
+  font-size: 0.75rem;
 }
 
 /* Popup / dialog (e.g. link dialog) */
@@ -167,30 +205,30 @@
 
 /* Paragraph */
 .dark-theme [role="textbox"] p {
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
-  line-height: 1.625;
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
+  line-height: 1.5;
 }
 
 /* Lists */
 .dark-theme [role="textbox"] ul {
   list-style-type: disc;
   padding-left: 1.5em;
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
 }
 
 .dark-theme [role="textbox"] ol {
   list-style-type: decimal;
   padding-left: 1.5em;
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
 }
 
 .dark-theme [role="textbox"] li {
-  margin-top: 0.25em;
-  margin-bottom: 0.25em;
-  line-height: 1.625;
+  margin-top: 0.1em;
+  margin-bottom: 0.1em;
+  line-height: 1.4;
 }
 
 /* Nested lists */
@@ -204,11 +242,52 @@
   list-style-type: square;
 }
 
-/* Task / check lists */
+/* Task / check lists — MDXEditor renders checkboxes as ::before/::after pseudo-elements */
 .dark-theme [role="textbox"] li[role="checkbox"] {
   list-style-type: none;
   position: relative;
-  padding-left: 0.25em;
+  padding-left: 1.5rem;
+  line-height: 1.4;
+}
+
+/* Checkbox box (both checked and unchecked) */
+.dark-theme [role="textbox"] li[role="checkbox"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.2em;
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 1px solid oklch(0.5 0 0);
+  border-radius: 0.2rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* Checked state: filled box */
+.dark-theme [role="textbox"] li[aria-checked="true"]::before {
+  background: oklch(0.488 0.243 264.376);
+  border-color: oklch(0.488 0.243 264.376);
+}
+
+/* Checkmark tick */
+.dark-theme [role="textbox"] li[aria-checked="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0.3rem;
+  top: 0.3em;
+  width: 0.3rem;
+  height: 0.55rem;
+  border: solid oklch(0.985 0 0);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+  cursor: pointer;
+}
+
+/* Strikethrough for completed items */
+.dark-theme [role="textbox"] li[aria-checked="true"] {
+  text-decoration: line-through;
+  color: oklch(0.55 0 0);
 }
 
 /* Blockquote */
@@ -245,11 +324,18 @@
 /* Inline code */
 .dark-theme [role="textbox"] code {
   background: oklch(0.25 0 0);
-  padding: 0.15em 0.35em;
+  padding: 0.15em 0.25em;
   border-radius: 0.25em;
   font-size: 0.875em;
+  color: oklch(0.7 0.15 270);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
+}
+
+/* Remove Tailwind Typography backtick pseudo-elements on inline code */
+.dark-theme [role="textbox"] code::before,
+.dark-theme [role="textbox"] code::after {
+  content: none;
 }
 
 /* Code blocks */
@@ -306,31 +392,164 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Source / diff view                                                  */
+/* CodeMirror code blocks                                              */
 /* ------------------------------------------------------------------ */
 
+/* Hide the floating language selector + delete button on code blocks */
+.dark-theme [class*="codeMirrorToolbar"] {
+  display: none !important;
+}
+
+/* Code block wrapper: clean bordered box */
+.dark-theme [class*="codeMirrorWrapper"] {
+  border: 1px solid oklch(0.3 0 0);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  padding: 0;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
 .dark-theme .cm-editor {
-  background: oklch(0.15 0 0);
+  background: oklch(0.13 0 0);
 }
 
 .dark-theme .cm-editor .cm-content {
   color: oklch(0.85 0 0);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
+  font-size: 0.875rem;
+  padding: 0.25rem 0.5rem;
 }
 
+/* Gutter: line numbers */
 .dark-theme .cm-editor .cm-gutters {
-  background: oklch(0.18 0 0);
-  border-color: oklch(0.3 0 0);
-  color: oklch(0.5 0 0);
+  background: oklch(0.13 0 0);
+  border-right: none;
+  color: oklch(0.45 0 0);
+  font-size: 0.75rem;
 }
 
+.dark-theme .cm-editor .cm-gutterElement {
+  padding: 0 0.5rem 0 0.4rem;
+  min-width: unset;
+  display: flex;
+  align-items: center;
+  line-height: normal;
+}
+
+/* Hide the fold gutter (collapse arrows) */
+.dark-theme .cm-editor .cm-foldGutter {
+  display: none !important;
+}
+
+/* Active line highlight — use outline instead of background so it doesn't
+   paint over child match highlights (.cm-selectionMatch, .cm-searchMatch) */
 .dark-theme .cm-editor .cm-activeLine {
-  background: oklch(0.2 0 0);
+  background: none !important;
+  box-shadow: inset 0 0 0 9999px rgb(255 255 255 / 0.03);
 }
 
 .dark-theme .cm-editor .cm-activeLineGutter {
-  background: oklch(0.22 0 0);
+  background: rgb(255 255 255 / 0.03);
+  color: oklch(0.6 0 0);
+}
+
+/* Text selection highlight — need high specificity to override CodeMirror inline styles */
+.dark-theme .cm-editor .cm-selectionBackground {
+  background-color: oklch(0.3 0.05 264) !important;
+}
+.dark-theme .cm-editor.cm-focused .cm-selectionBackground {
+  background-color: oklch(0.3 0.05 264) !important;
+}
+.dark-theme .cm-editor .cm-line ::selection {
+  background-color: oklch(0.3 0.05 264) !important;
+}
+.dark-theme .cm-editor .cm-selectionLayer .cm-selectionBackground {
+  background-color: oklch(0.3 0.05 264) !important;
+}
+
+/* Selection match highlight (when you select text, matching occurrences are highlighted) */
+.dark-theme .cm-editor .cm-selectionMatch {
+  background-color: rgb(99 102 241 / 0.45) !important;
+}
+
+/* Search match highlight (Ctrl+F) */
+.dark-theme .cm-editor .cm-searchMatch {
+  background-color: rgb(234 179 8 / 0.5) !important;
+}
+.dark-theme .cm-editor .cm-searchMatch-selected {
+  background-color: rgb(234 179 8 / 0.7) !important;
+}
+
+/* Matching bracket highlight */
+.dark-theme .cm-editor .cm-matchingBracket {
+  background: oklch(0.3 0.08 264);
+  color: oklch(0.92 0 0);
+}
+
+/* Cursor colour */
+.dark-theme .cm-editor .cm-cursor {
+  border-left-color: oklch(0.85 0 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Search / Find & Replace                                            */
+/* ------------------------------------------------------------------ */
+
+/* Search highlight colours via CSS Highlights API */
+::highlight(MdxSearch) {
+  background-color: oklch(0.55 0.15 85); /* amber */
+  color: oklch(0.15 0 0);
+}
+
+::highlight(MdxFocusSearch) {
+  background-color: oklch(0.7 0.2 85); /* bright amber for focused match */
+  color: oklch(0.1 0 0);
+}
+
+/* Search bar container */
+.dark-theme .mdxeditor-search-bar,
+.dark-theme [class*="searchContainer"] {
+  background: oklch(0.205 0 0);
+  border: 1px solid oklch(0.3 0 0);
+  border-radius: 0.5rem;
+  color: oklch(0.92 0 0);
+  padding: 0.5rem;
+}
+
+/* Search inputs */
+.dark-theme .mdxeditor-search-bar input,
+.dark-theme [class*="searchContainer"] input {
+  background: oklch(0.15 0 0);
+  border: 1px solid oklch(0.35 0 0);
+  border-radius: 0.25rem;
+  color: oklch(0.92 0 0);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.875rem;
+  outline: none;
+}
+
+.dark-theme .mdxeditor-search-bar input:focus,
+.dark-theme [class*="searchContainer"] input:focus {
+  border-color: oklch(0.488 0.243 264.376);
+}
+
+/* Search buttons */
+.dark-theme .mdxeditor-search-bar button,
+.dark-theme [class*="searchContainer"] button {
+  color: oklch(0.75 0 0);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0.2rem 0.4rem;
+  border-radius: 0.25rem;
+}
+
+.dark-theme .mdxeditor-search-bar button:hover,
+.dark-theme [class*="searchContainer"] button:hover {
+  background: oklch(0.3 0 0);
+  color: oklch(0.92 0 0);
 }
 
 /* ------------------------------------------------------------------ */

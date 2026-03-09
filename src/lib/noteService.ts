@@ -18,8 +18,10 @@ export interface NoteMeta {
   filePath: string;
   createdAt: string;
   updatedAt: string;
-  ticketId: string | null;
+  ticketIds: string[];
   isOpen: boolean;
+  preview: string;
+  starred: boolean;
 }
 
 /** Shape of the row returned by SQLite SELECT on the notes table. */
@@ -32,6 +34,8 @@ interface NoteRow {
   ticket_id: string | null;
   is_open: number; // SQLite stores booleans as 0/1
   window_state: string | null;
+  preview: string | null;
+  starred: number; // SQLite stores booleans as 0/1
 }
 
 // ---------------------------------------------------------------------------
@@ -120,16 +124,43 @@ async function ensureNotesDir(): Promise<void> {
 /**
  * Convert a SQLite NoteRow to a NoteMeta object.
  */
-function rowToMeta(row: NoteRow): NoteMeta {
+function rowToMeta(row: NoteRow, ticketIds: string[] = []): NoteMeta {
   return {
     id: row.id,
     title: row.title,
     filePath: row.file_path,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    ticketId: row.ticket_id,
+    ticketIds,
     isOpen: row.is_open === 1,
+    preview: row.preview ?? "",
+    starred: row.starred === 1,
   };
+}
+
+/**
+ * Extract a plain-text preview from markdown content.
+ * Strips frontmatter, markdown formatting, and trims to maxLen.
+ */
+function extractPreview(markdown: string, maxLen = 100): string {
+  // Strip frontmatter
+  let text = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+  // Strip headings markers
+  text = text.replace(/^#{1,6}\s+/gm, "");
+  // Strip bold/italic markers
+  text = text.replace(/(\*{1,3}|_{1,3})(.*?)\1/g, "$2");
+  // Strip links: [text](url) -> text
+  text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+  // Strip images
+  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
+  // Strip inline code backticks
+  text = text.replace(/`([^`]*)`/g, "$1");
+  // Strip code fences
+  text = text.replace(/```[\s\S]*?```/g, "");
+  // Collapse whitespace
+  text = text.replace(/\s+/g, " ").trim();
+
+  return text.length > maxLen ? text.slice(0, maxLen) + "..." : text;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,14 +200,22 @@ export async function createNote(): Promise<NoteMeta> {
     [id, title, filePath, createdAt, createdAt],
   );
 
+  // Insert into FTS index
+  await db.execute(
+    `INSERT INTO notes_fts (note_id, title) VALUES ($1, $2)`,
+    [id, title],
+  );
+
   return {
     id,
     title,
     filePath,
     createdAt,
     updatedAt: createdAt,
-    ticketId: null,
+    ticketIds: [],
     isOpen: false,
+    preview: "",
+    starred: false,
   };
 }
 
@@ -196,7 +235,11 @@ export async function loadNote(
     throw new Error(`Note not found: ${id}`);
   }
 
-  const meta = rowToMeta(rows[0]!);
+  const ticketRows = await db.select<{ ticket_id: string }[]>(
+    "SELECT ticket_id FROM note_tickets WHERE note_id = $1",
+    [id],
+  );
+  const meta = rowToMeta(rows[0]!, ticketRows.map((r) => r.ticket_id));
 
   const content = await readTextFile(meta.filePath, {
     baseDir: BaseDirectory.Home,
@@ -227,15 +270,23 @@ export async function saveNote(id: string, content: string): Promise<void> {
     baseDir: BaseDirectory.Home,
   });
 
-  // Parse title from content
+  // Parse title from content and compute preview
   const parsedTitle = parseTitleFromContent(content);
   const newTitle = parsedTitle ?? row.title;
   const updatedAt = new Date().toISOString();
+  const preview = extractPreview(content);
 
   // Update SQLite
   await db.execute(
-    `UPDATE notes SET title = $1, updated_at = $2 WHERE id = $3`,
-    [newTitle, updatedAt, id],
+    `UPDATE notes SET title = $1, updated_at = $2, preview = $3 WHERE id = $4`,
+    [newTitle, updatedAt, preview, id],
+  );
+
+  // Refresh FTS index
+  await db.execute(`DELETE FROM notes_fts WHERE note_id = $1`, [id]);
+  await db.execute(
+    `INSERT INTO notes_fts (note_id, title) VALUES ($1, $2)`,
+    [id, newTitle],
   );
 }
 
@@ -258,19 +309,64 @@ export async function deleteNote(id: string): Promise<void> {
   // Delete file from disk
   await remove(filePath, { baseDir: BaseDirectory.Home });
 
+  // Delete from FTS index
+  await db.execute("DELETE FROM notes_fts WHERE note_id = $1", [id]);
+
   // Delete SQLite row
   await db.execute("DELETE FROM notes WHERE id = $1", [id]);
+}
+
+/**
+ * Backfill empty preview fields by reading each note's .md file.
+ * Runs once per app session.
+ */
+let previewsBackfilled = false;
+async function backfillPreviews(): Promise<void> {
+  if (previewsBackfilled) return;
+  previewsBackfilled = true;
+
+  const db = await getDatabase();
+  const rows = await db.select<{ id: string; file_path: string }[]>(
+    "SELECT id, file_path FROM notes WHERE preview IS NULL OR preview = ''",
+  );
+  for (const row of rows) {
+    try {
+      const content = await readTextFile(row.file_path, { baseDir: BaseDirectory.Home });
+      const preview = extractPreview(content);
+      if (preview) {
+        await db.execute("UPDATE notes SET preview = $1 WHERE id = $2", [preview, row.id]);
+      }
+    } catch {
+      // File may not exist — skip
+    }
+  }
 }
 
 /**
  * List all notes, ordered by most recently updated first.
  */
 export async function listNotes(): Promise<NoteMeta[]> {
+  await backfillPreviews();
   const db = await getDatabase();
   const rows = await db.select<NoteRow[]>(
     "SELECT * FROM notes ORDER BY updated_at DESC",
   );
-  return rows.map(rowToMeta);
+
+  // Fetch all note↔ticket links in one query
+  const noteTickets = await db.select<{ note_id: string; ticket_id: string }[]>(
+    "SELECT note_id, ticket_id FROM note_tickets",
+  );
+  const ticketsByNote = new Map<string, string[]>();
+  for (const nt of noteTickets) {
+    const existing = ticketsByNote.get(nt.note_id);
+    if (existing) {
+      existing.push(nt.ticket_id);
+    } else {
+      ticketsByNote.set(nt.note_id, [nt.ticket_id]);
+    }
+  }
+
+  return rows.map((r) => rowToMeta(r, ticketsByNote.get(r.id) ?? []));
 }
 
 /**
@@ -288,29 +384,103 @@ export async function setNoteOpen(
 }
 
 // ---------------------------------------------------------------------------
+// Star / rename
+// ---------------------------------------------------------------------------
+
+/**
+ * Toggle the starred status of a note.
+ */
+export async function toggleNoteStarred(id: string): Promise<void> {
+  const db = await getDatabase();
+  await db.execute(
+    "UPDATE notes SET starred = CASE WHEN starred = 1 THEN 0 ELSE 1 END WHERE id = $1",
+    [id],
+  );
+}
+
+/**
+ * Rename a note: updates the title in SQLite and rewrites the frontmatter
+ * `title:` field in the .md file on disk.
+ */
+export async function renameNote(
+  id: string,
+  newTitle: string,
+): Promise<void> {
+  const db = await getDatabase();
+  const rows = await db.select<NoteRow[]>(
+    "SELECT file_path FROM notes WHERE id = $1",
+    [id],
+  );
+
+  if (rows.length === 0) {
+    throw new Error(`Note not found: ${id}`);
+  }
+
+  const filePath = rows[0]!.file_path;
+
+  // Read file, update frontmatter title
+  const content = await readTextFile(filePath, {
+    baseDir: BaseDirectory.Home,
+  });
+
+  let updatedContent: string;
+  const fmMatch = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/);
+  if (fmMatch) {
+    const updatedFm = fmMatch[2]!.replace(
+      /^title:\s*.+$/m,
+      `title: ${newTitle}`,
+    );
+    updatedContent = `${fmMatch[1]}${updatedFm}${fmMatch[3]}${content.slice(fmMatch[0].length)}`;
+  } else {
+    // No frontmatter — just update SQLite
+    updatedContent = content;
+  }
+
+  await writeTextFile(filePath, updatedContent, {
+    baseDir: BaseDirectory.Home,
+  });
+
+  const updatedAt = new Date().toISOString();
+  await db.execute(
+    "UPDATE notes SET title = $1, updated_at = $2 WHERE id = $3",
+    [newTitle, updatedAt, id],
+  );
+
+  // Refresh FTS index
+  await db.execute(`DELETE FROM notes_fts WHERE note_id = $1`, [id]);
+  await db.execute(
+    `INSERT INTO notes_fts (note_id, title) VALUES ($1, $2)`,
+    [id, newTitle],
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Ticket linking
 // ---------------------------------------------------------------------------
 
 /**
- * Link a note to a ticket by setting its ticket_id.
+ * Link a note to a ticket via the junction table.
  */
 export async function linkNoteToTicket(
   noteId: string,
   ticketId: string,
 ): Promise<void> {
   const db = await getDatabase();
-  await db.execute("UPDATE notes SET ticket_id = $1 WHERE id = $2", [
-    ticketId,
-    noteId,
-  ]);
+  await db.execute(
+    "INSERT OR IGNORE INTO note_tickets (note_id, ticket_id) VALUES ($1, $2)",
+    [noteId, ticketId],
+  );
 }
 
 /**
- * Unlink a note from its ticket by clearing ticket_id.
+ * Unlink a note from a specific ticket.
  */
-export async function unlinkNote(noteId: string): Promise<void> {
+export async function unlinkNote(noteId: string, ticketId: string): Promise<void> {
   const db = await getDatabase();
-  await db.execute("UPDATE notes SET ticket_id = NULL WHERE id = $1", [noteId]);
+  await db.execute(
+    "DELETE FROM note_tickets WHERE note_id = $1 AND ticket_id = $2",
+    [noteId, ticketId],
+  );
 }
 
 /**
@@ -319,8 +489,58 @@ export async function unlinkNote(noteId: string): Promise<void> {
 export async function getLinkedNotes(ticketId: string): Promise<NoteMeta[]> {
   const db = await getDatabase();
   const rows = await db.select<NoteRow[]>(
-    "SELECT * FROM notes WHERE ticket_id = $1 ORDER BY updated_at DESC",
+    `SELECT n.* FROM notes n
+     JOIN note_tickets nt ON nt.note_id = n.id
+     WHERE nt.ticket_id = $1
+     ORDER BY n.updated_at DESC`,
     [ticketId],
   );
-  return rows.map(rowToMeta);
+  // Fetch ticket links for each note
+  const noteIds = rows.map((r) => r.id);
+  if (noteIds.length === 0) return [];
+  const allLinks = await db.select<{ note_id: string; ticket_id: string }[]>(
+    "SELECT note_id, ticket_id FROM note_tickets",
+  );
+  const ticketsByNote = new Map<string, string[]>();
+  for (const link of allLinks) {
+    if (!noteIds.includes(link.note_id)) continue;
+    const existing = ticketsByNote.get(link.note_id);
+    if (existing) existing.push(link.ticket_id);
+    else ticketsByNote.set(link.note_id, [link.ticket_id]);
+  }
+  return rows.map((r) => rowToMeta(r, ticketsByNote.get(r.id) ?? []));
 }
+
+// ---------------------------------------------------------------------------
+// Full-text search
+// ---------------------------------------------------------------------------
+
+/**
+ * Search notes using FTS5 full-text search.
+ * Each word token is wrapped in double quotes with a * suffix for prefix matching.
+ * Results are ordered by FTS5 rank (best match first).
+ */
+export async function searchNotes(query: string): Promise<NoteMeta[]> {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+
+  // Sanitize: split into word tokens, wrap each in quotes with * for prefix matching
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const ftsQuery = tokens.map((t) => `"${t.replace(/"/g, "")}"*`).join(" ");
+
+  const db = await getDatabase();
+  const rows = await db.select<NoteRow[]>(
+    `SELECT n.*
+     FROM notes_fts fts
+     JOIN notes n ON n.id = fts.note_id
+     WHERE notes_fts MATCH $1
+     ORDER BY fts.rank`,
+    [ftsQuery],
+  );
+  return rows.map((r) => rowToMeta(r));
+}
+
+// ---------------------------------------------------------------------------
+// Note tags
+// ---------------------------------------------------------------------------
+

@@ -5,9 +5,14 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { ControlPanel } from "./pages/ControlPanel";
 import { NoteWindow } from "./pages/NoteWindow";
 import { SessionWindow } from "./pages/SessionWindow";
+import { SessionGroupWindow } from "./pages/SessionGroupWindow";
+import { LogFileWindow } from "./pages/LogFileWindow";
+import { invoke } from "@tauri-apps/api/core";
 import { createNote, setNoteOpen } from "./lib/noteService";
 import { createNoteWindow } from "./lib/windowManager";
 import { useGlobalStore } from "./stores/globalStore";
+import { getHotkeyBindings, getDefaultHotkeys } from "./lib/settingsService";
+import { FindBar } from "./components/FindBar";
 
 /**
  * Listen for global hotkey events emitted from the Rust backend.
@@ -17,6 +22,9 @@ function useHotkeyListeners() {
   useEffect(() => {
     const unlisteners = [
       listen("hotkey:new-note", async () => {
+        // Only the main window handles note creation to avoid duplicates
+        const win = getCurrentWebviewWindow();
+        if (win.label !== "main") return;
         console.log("[hoverpad] Hotkey: New Note triggered");
         try {
           const note = await createNote();
@@ -34,6 +42,23 @@ function useHotkeyListeners() {
       listen("hotkey:opacity-increase", () => {
         useGlobalStore.getState().adjustOpacity(0.1);
       }),
+      listen("hotkey:toggle-visibility", () => {
+        useGlobalStore.getState().toggleVisibility();
+      }),
+      listen("hotkey:toggle-collapse", () => {
+        // Only the main window handles collapse toggle
+        const win = getCurrentWebviewWindow();
+        if (win.label === "main") {
+          useGlobalStore.getState().toggleCollapse();
+        }
+      }),
+      listen("hotkey:hide-children", () => {
+        // Only the main window handles hide-children
+        const win = getCurrentWebviewWindow();
+        if (win.label === "main") {
+          useGlobalStore.getState().toggleHideChildren();
+        }
+      }),
     ];
 
     return () => {
@@ -42,6 +67,37 @@ function useHotkeyListeners() {
         promise.then((unlisten) => unlisten());
       }
     };
+  }, []);
+}
+
+/**
+ * On mount, loads custom hotkey bindings from the database and re-registers
+ * any that differ from the defaults with the Rust backend.
+ */
+function useCustomHotkeys() {
+  useEffect(() => {
+    (async () => {
+      try {
+        const bindings = await getHotkeyBindings();
+        const defaults = getDefaultHotkeys();
+
+        for (const [action, shortcut] of Object.entries(bindings)) {
+          const defaultShortcut = defaults[action];
+          if (shortcut !== defaultShortcut && defaultShortcut) {
+            // Unregister the default, register the custom one
+            await invoke("unregister_hotkey", {
+              shortcutStr: defaultShortcut,
+            });
+            await invoke("register_hotkey", {
+              action,
+              shortcutStr: shortcut,
+            });
+          }
+        }
+      } catch (err) {
+        console.error("[hoverpad] Failed to apply custom hotkeys:", err);
+      }
+    })();
   }, []);
 }
 
@@ -57,11 +113,37 @@ function useOpacityEffect() {
     // Apply visual opacity via CSS on the document root element
     document.documentElement.style.opacity = String(opacity);
 
-    // Click-through at low opacity
+    // Click-through when hidden (opacity 0) or at the minimum threshold
     const isClickThrough = opacity < 0.2;
     const appWindow = getCurrentWebviewWindow();
     appWindow.setIgnoreCursorEvents(isClickThrough).catch(console.error);
   }, [opacity]);
+}
+
+/**
+ * Hides/shows child windows (non-main) when the hide-children toggle fires.
+ * Main window handles its own collapse separately in ControlPanel.
+ */
+function useChildrenHiddenEffect() {
+  const childrenHidden = useGlobalStore((s) => s.childrenHidden);
+  const isFirstRender = useRef(true);
+
+  useEffect(() => {
+    // Skip initial render — don't hide on mount
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+
+    const win = getCurrentWebviewWindow();
+    if (win.label === "main") return; // ControlPanel handles itself
+
+    if (childrenHidden) {
+      win.hide().catch(console.error);
+    } else {
+      win.show().catch(console.error);
+    }
+  }, [childrenHidden]);
 }
 
 /**
@@ -70,6 +152,7 @@ function useOpacityEffect() {
  */
 function OpacityIndicator() {
   const opacity = useGlobalStore((s) => s.opacity);
+  const isHidden = useGlobalStore((s) => s.isHidden);
   const [visible, setVisible] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const isFirstRender = useRef(true);
@@ -86,13 +169,15 @@ function OpacityIndicator() {
     timerRef.current = setTimeout(() => setVisible(false), 1000);
 
     return () => clearTimeout(timerRef.current);
-  }, [opacity]);
+  }, [opacity, isHidden]);
 
   if (!visible) return null;
 
+  const label = isHidden ? "Hidden" : `Opacity: ${Math.round(opacity * 100)}%`;
+
   return (
     <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-full border border-neutral-700/50 bg-neutral-800/90 px-3 py-1 text-xs text-neutral-300 backdrop-blur-md">
-      Opacity: {Math.round(opacity * 100)}%
+      {label}
     </div>
   );
 }
@@ -104,15 +189,20 @@ function OpacityIndicator() {
  */
 export function App() {
   useHotkeyListeners();
+  useCustomHotkeys();
   useOpacityEffect();
+  useChildrenHiddenEffect();
 
   return (
     <BrowserRouter>
+      <FindBar />
       <OpacityIndicator />
       <Routes>
         <Route path="/" element={<ControlPanel />} />
         <Route path="/note/:id" element={<NoteWindow />} />
         <Route path="/session/:id" element={<SessionWindow />} />
+        <Route path="/session-group/:groupType/:groupId" element={<SessionGroupWindow />} />
+        <Route path="/log-file/:id" element={<LogFileWindow />} />
       </Routes>
     </BrowserRouter>
   );
