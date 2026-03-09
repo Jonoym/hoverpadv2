@@ -45,6 +45,7 @@ export const ACTION_LABELS: Record<string, string> = {
   "new-note": "New Note",
   "toggle-visibility": "Toggle Visibility",
   "toggle-collapse": "Toggle Control Panel",
+  "hide-children": "Hide Children",
   "opacity-decrease": "Decrease Opacity",
   "opacity-increase": "Increase Opacity",
 };

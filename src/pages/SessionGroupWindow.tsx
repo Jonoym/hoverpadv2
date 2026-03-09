@@ -22,6 +22,7 @@ import {
   type SessionMeta,
 } from "@/lib/sessionService";
 import { emitEvent, listenEvent } from "@/lib/events";
+import { useGlobalStore } from "@/stores/globalStore";
 import { getSetting, setSetting } from "@/lib/settingsService";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
@@ -170,6 +171,14 @@ export function SessionGroupWindow() {
   const refresh = useCallback(async () => {
     try {
       const all = await discoverSessions();
+      // Apply status overrides from open session windows (same as globalStore)
+      const overrides = useGlobalStore.getState().sessionStatusOverrides;
+      for (const session of all) {
+        const override = overrides[session.sessionId];
+        if (override) {
+          session.status = override;
+        }
+      }
       setSessions(filterSessions(all));
       if (!isProject) {
         const groups = await listManualGroups();
@@ -189,6 +198,23 @@ export function SessionGroupWindow() {
     }
     setOpenSessionIds(ids);
   }, [sessions]);
+
+  // Subscribe to status override changes for immediate updates
+  const sessionStatusOverrides = useGlobalStore((s) => s.sessionStatusOverrides);
+  useEffect(() => {
+    setSessions((prev) => {
+      let changed = false;
+      const updated = prev.map((s) => {
+        const override = sessionStatusOverrides[s.sessionId];
+        if (override && s.status !== override) {
+          changed = true;
+          return { ...s, status: override };
+        }
+        return s;
+      });
+      return changed ? updated : prev;
+    });
+  }, [sessionStatusOverrides]);
 
   useEffect(() => {
     homeDir().then(setHomePath).catch(console.error);

@@ -283,7 +283,7 @@ pub fn run() {
         let mut map = hotkey_state.bindings.lock().unwrap();
         map.insert("Ctrl+N".to_string(), "new-note".to_string());
         map.insert("Ctrl+H".to_string(), "toggle-visibility".to_string());
-        map.insert("Ctrl+Shift+J".to_string(), "toggle-collapse".to_string());
+        map.insert("Ctrl+J".to_string(), "toggle-collapse".to_string());
         map.insert("Ctrl+Shift+D".to_string(), "hide-children".to_string());
         map.insert("Ctrl+,".to_string(), "opacity-decrease".to_string());
         map.insert("Ctrl+.".to_string(), "opacity-increase".to_string());
@@ -344,7 +344,7 @@ pub fn run() {
                 let default_shortcuts = [
                     ("Ctrl+N", "new-note"),
                     ("Ctrl+H", "toggle-visibility"),
-                    ("Ctrl+Shift+J", "toggle-collapse"),
+                    ("Ctrl+J", "toggle-collapse"),
                     ("Ctrl+Shift+D", "hide-children"),
                     ("Ctrl+,", "opacity-decrease"),
                     ("Ctrl+.", "opacity-increase"),
