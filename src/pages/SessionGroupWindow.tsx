@@ -16,6 +16,7 @@ import {
   listManualGroups,
   renameManualGroup,
   renameSession,
+  invalidateSessionCache,
   deleteSession,
   getSessionLogPath,
   toHomeRelativePath,
@@ -26,6 +27,7 @@ import { useGlobalStore } from "@/stores/globalStore";
 import { getSetting, setSetting } from "@/lib/settingsService";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
+import { useWindowGrouping } from "@/lib/useWindowGrouping";
 
 // ---------------------------------------------------------------------------
 // Status helpers
@@ -223,7 +225,16 @@ export function SessionGroupWindow() {
     // Then do a full disk scan to pick up fresh status
     void refresh();
     const interval = setInterval(() => void refresh(), 5_000);
-    const unlistenRename = listenEvent("session:renamed", () => { void refresh(); });
+    const unlistenRename = listenEvent("session:renamed", (e) => {
+      // Synchronous in-memory patch — no async, no races
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === e.payload.sessionId ? { ...s, label: e.payload.newLabel } : s,
+        ),
+      );
+      // Invalidate this window's cache so the next 5s poll doesn't revert the label
+      invalidateSessionCache(e.payload.sessionId);
+    });
     return () => {
       clearInterval(interval);
       unlistenRename.then((fn) => fn()).catch(console.error);
@@ -416,6 +427,8 @@ export function SessionGroupWindow() {
     }
   };
 
+  const { isGrouped, snapPreview, ungroup: handleUngroup, ungroupAll: handleUngroupAll } = useWindowGrouping();
+
   const handleStartRename = (session: SessionMeta) => {
     setCtxMenu(null);
     setRenamingId(session.id);
@@ -426,14 +439,19 @@ export function SessionGroupWindow() {
     if (!renamingId) return;
     const trimmed = renameValue.trim();
     const label = trimmed && trimmed !== renamingId.slice(0, 8) ? trimmed : null;
+    // 1. Synchronous local patch — instant UI update, no races
+    setSessions((prev) =>
+      prev.map((s) => (s.id === renamingId ? { ...s, label } : s)),
+    );
+    setRenamingId(null);
     try {
+      // 2. Persist to DB + invalidate cache
       await renameSession(renamingId, label);
-      void refresh();
+      // 3. Broadcast to other windows
       await emitEvent("session:renamed", { sessionId: renamingId, newLabel: label });
     } catch (err) {
       console.error("[hoverpad] Failed to rename session:", err);
     }
-    setRenamingId(null);
   };
 
   const handleOpenLogFile = async (session: SessionMeta) => {
@@ -467,8 +485,23 @@ export function SessionGroupWindow() {
   return (
     <WindowChrome
       title={title}
-      showMinimize={false}
+      titleIcon={isProject ? (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+        </svg>
+      ) : (
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polygon points="12 2 2 7 12 12 22 7 12 2" />
+          <polyline points="2 17 12 22 22 17" />
+          <polyline points="2 12 12 17 22 12" />
+        </svg>
+      )}
+      showMinimize={true}
       onRename={!isProject ? handleRename : undefined}
+      isGrouped={isGrouped}
+      onUngroup={isGrouped ? () => void handleUngroup() : undefined}
+      onUngroupAll={isGrouped ? () => void handleUngroupAll() : undefined}
+      snapPreview={snapPreview}
     >
       {/* Header stats */}
       <div className="flex items-center gap-3 px-1 pb-2 text-xs text-neutral-500">

@@ -331,6 +331,22 @@ async function runMigrations(database: Database): Promise<void> {
   } catch {
     // Column already exists — safe to ignore
   }
+
+  // -- Clipboard history entries
+  await database.execute(`
+    CREATE TABLE IF NOT EXISTS clipboard_entries (
+      id           TEXT PRIMARY KEY,
+      content      TEXT NOT NULL,
+      content_type TEXT NOT NULL DEFAULT 'text',
+      preview      TEXT NOT NULL DEFAULT '',
+      copied_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      pinned       INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await database.execute(`
+    CREATE INDEX IF NOT EXISTS idx_clipboard_entries_copied_at
+      ON clipboard_entries(copied_at DESC)
+  `);
 }
 
 /**

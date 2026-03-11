@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
 import { emitEvent, listenEvent } from "@/lib/events";
 import { ContextMenuPopover } from "@/components/ContextMenu";
@@ -17,6 +18,8 @@ export interface WindowChromeProps {
   badge?: { label: string; color: "blue" | "emerald" | "amber" | "purple" | "red" };
   /** Renders a small colored dot to the left of the title text. */
   statusDot?: { color: string };
+  /** Optional icon rendered before the title text. */
+  titleIcon?: React.ReactNode;
   children: React.ReactNode;
   showMinimize?: boolean;
   /** Called before the window closes. Awaited before the actual close. */
@@ -25,17 +28,30 @@ export interface WindowChromeProps {
   onCollapse?: () => void;
   /** Called when the user finishes renaming via the title bar context menu. */
   onRename?: (newName: string) => void;
+  /** When true, shows a group indicator and enables the "Ungroup" context menu item. */
+  isGrouped?: boolean;
+  /** Called when the user clicks "Ungroup" from the context menu. */
+  onUngroup?: () => void;
+  /** Called when the user clicks "Ungroup All" — dissolves the entire group. */
+  onUngroupAll?: () => void;
+  /** When true, shows a blue border indicating a snap/group is about to happen. */
+  snapPreview?: boolean;
 }
 
 export function WindowChrome({
   title,
   badge,
   statusDot,
+  titleIcon,
   children,
   showMinimize = true,
   onBeforeClose,
   onCollapse,
   onRename,
+  isGrouped,
+  onUngroup,
+  onUngroupAll,
+  snapPreview,
 }: WindowChromeProps) {
   const appWindow = getCurrentWebviewWindow();
 
@@ -60,6 +76,11 @@ export function WindowChrome({
       }
     });
     return () => { unlisten.then((fn) => fn()); };
+  }, [appWindow.label]);
+
+  // Prevent double-click maximize on the title bar (Win32 subclass)
+  useEffect(() => {
+    invoke("prevent_maximize", { label: appWindow.label }).catch(console.error);
   }, [appWindow.label]);
 
   // Close context menu on outside click
@@ -92,9 +113,33 @@ export function WindowChrome({
     }
   }, [renameValue, title, onRename]);
 
-  const handleMinimize = async () => {
-    await appWindow.minimize();
-  };
+  const handleMinimize = useCallback(() => {
+    document.documentElement.dataset.minimized = "true";
+    document.documentElement.style.opacity = "0";
+    appWindow.setIgnoreCursorEvents(true).catch(console.error);
+    emitEvent("window:minimized", { label: appWindow.label, minimized: true }).catch(console.error);
+  }, [appWindow]);
+
+  const handleRestore = useCallback(async () => {
+    delete document.documentElement.dataset.minimized;
+    // Re-apply the current global opacity
+    const { useGlobalStore } = await import("@/stores/globalStore");
+    const opacity = useGlobalStore.getState().opacity;
+    document.documentElement.style.opacity = String(opacity);
+    await appWindow.setIgnoreCursorEvents(opacity < 0.2);
+    await emitEvent("window:minimized", { label: appWindow.label, minimized: false });
+  }, [appWindow]);
+
+  // Listen for restore events
+  useEffect(() => {
+    const label = appWindow.label;
+    const unlisten = listenEvent("window:restore", (e) => {
+      if (e.payload.label === label || e.payload.label === "*") {
+        handleRestore();
+      }
+    });
+    return () => { unlisten.then((fn) => fn()).catch(console.error); };
+  }, [appWindow.label, handleRestore]);
 
   const handleClose = async () => {
     // Run any pre-close logic (e.g. marking note as closed in DB)
@@ -103,17 +148,18 @@ export function WindowChrome({
     }
 
     // Determine window type from the label prefix
-    const windowType = appWindow.label.startsWith("note-")
-      ? "note"
-      : appWindow.label.startsWith("session-")
-        ? "session"
-        : null;
+    const label = appWindow.label;
+    const windowType: Parameters<typeof emitEvent<"window:closed">>[1]["windowType"] | null =
+      label.startsWith("note-") ? "note"
+      : label.startsWith("sg-") || label.startsWith("session-group-custom-") ? "session-group"
+      : label.startsWith("session-") ? "session"
+      : label.startsWith("logfile-") ? "logfile"
+      : label === "clipboard" ? "clipboard"
+      : label === "notifications" ? "notifications"
+      : null;
 
     if (windowType) {
-      await emitEvent("window:closed", {
-        label: appWindow.label,
-        windowType,
-      });
+      await emitEvent("window:closed", { label, windowType });
     }
 
     await appWindow.close();
@@ -130,8 +176,10 @@ export function WindowChrome({
       <div
         className={cn(
           "flex flex-1 flex-col",
-          "rounded-2xl border bg-neutral-900/90 transition-colors duration-300",
-          flashColor ?? "border-neutral-700/50",
+          "rounded-2xl border bg-neutral-900/90 transition-colors duration-200",
+          snapPreview
+            ? "border-blue-500/70 shadow-[0_0_12px_rgba(59,130,246,0.3)]"
+            : flashColor ?? "border-neutral-700/50",
           "shadow-2xl backdrop-blur-md",
           "overflow-hidden",
         )}
@@ -144,7 +192,7 @@ export function WindowChrome({
             "rounded-t-2xl bg-neutral-800/50 px-3",
           )}
           onContextMenu={(e) => {
-            if (onRename) {
+            if (onRename || onUngroup || onUngroupAll) {
               e.preventDefault();
               setCtxMenu({ x: e.clientX, y: e.clientY });
             }
@@ -155,6 +203,11 @@ export function WindowChrome({
             data-tauri-drag-region
             className="flex items-center gap-2 overflow-hidden"
           >
+            {titleIcon && (
+              <span data-tauri-drag-region className="shrink-0 text-neutral-400">
+                {titleIcon}
+              </span>
+            )}
             {statusDot && (
               <span
                 data-tauri-drag-region
@@ -197,6 +250,24 @@ export function WindowChrome({
 
           {/* Right: window controls */}
           <div className="flex items-center gap-1">
+            {isGrouped && onUngroup && (
+              <button
+                type="button"
+                onClick={onUngroup}
+                className={cn(
+                  "flex h-6 w-6 items-center justify-center rounded-md",
+                  "bg-blue-500/15 text-blue-400 transition-colors duration-150",
+                  "hover:bg-blue-500/30 hover:text-blue-300",
+                )}
+                title="Ungroup this window"
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                  <path d="M7 9l2-2" />
+                  <path d="M11 5l-1.5 1.5a2.12 2.12 0 0 1 0 3l0 0a2.12 2.12 0 0 1-3 0L5 11" />
+                  <path d="M5 11l1.5-1.5a2.12 2.12 0 0 1 0-3l0 0a2.12 2.12 0 0 1 3 0L11 5" />
+                </svg>
+              </button>
+            )}
             {onCollapse && (
               <button
                 type="button"
@@ -292,13 +363,33 @@ export function WindowChrome({
       {/* Title bar context menu */}
       {ctxMenu && (
         <ContextMenuPopover x={ctxMenu.x} y={ctxMenu.y}>
-          <button
-            type="button"
-            onClick={handleStartRename}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-700/60 cursor-pointer"
-          >
-            Rename
-          </button>
+          {onRename && (
+            <button
+              type="button"
+              onClick={handleStartRename}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-700/60 cursor-pointer"
+            >
+              Rename
+            </button>
+          )}
+          {isGrouped && onUngroup && (
+            <button
+              type="button"
+              onClick={() => { setCtxMenu(null); onUngroup(); }}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-700/60 cursor-pointer"
+            >
+              Ungroup
+            </button>
+          )}
+          {isGrouped && onUngroupAll && (
+            <button
+              type="button"
+              onClick={() => { setCtxMenu(null); onUngroupAll(); }}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-700/60 cursor-pointer"
+            >
+              Ungroup All
+            </button>
+          )}
         </ContextMenuPopover>
       )}
     </div>

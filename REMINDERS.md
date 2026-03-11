@@ -11,3 +11,6 @@
 ## Status Bar Changes
 - Show the number of notes, sessions (active, idle, done and runnign agents statuses) at the top
 - make it clear when an agent is done
+
+
+need to fix naming and window updates

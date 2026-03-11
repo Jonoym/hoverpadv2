@@ -5,14 +5,23 @@ import type { SessionEvent } from "./sessionService";
  * Typed event payloads for cross-window communication.
  */
 export interface HoverpadEventMap {
-  "window:opened": { label: string; windowType: "note" | "session" | "session-group" | "logfile" };
-  "window:closed": { label: string; windowType: "note" | "session" | "session-group" | "logfile" };
+  "window:opened": { label: string; windowType: "note" | "session" | "session-group" | "logfile" | "clipboard" | "notifications" };
+  "window:closed": { label: string; windowType: "note" | "session" | "session-group" | "logfile" | "clipboard" | "notifications" };
   "window:flash": { label: string; color?: string };
   "test:ping": { from: string; message: string };
   "session:event": { sessionId: string; event: SessionEvent };
   "session:status": { sessionId: string; status: "active" | "completed" | "errored" };
+  "session:notify": { sessionId: string; label: string; status: "completed" | "errored" };
   "note:renamed": { noteId: string; newTitle: string };
   "session:renamed": { sessionId: string; newLabel: string | null };
+  /** Signals to a window that another window is about to snap to it. */
+  "window:snap-preview": { label: string; active: boolean };
+  /** Restore a minimized (opacity-hidden) window. label "*" restores all. */
+  "window:restore": { label: string };
+  /** Broadcast when a window is minimized or restored. */
+  "window:minimized": { label: string; minimized: boolean };
+  /** Emitted by Rust file watcher when a session .jsonl file changes. */
+  "session:file-changed": { path: string };
 }
 
 export type HoverpadEventName = keyof HoverpadEventMap;

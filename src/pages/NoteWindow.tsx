@@ -6,6 +6,7 @@ import { loadNote, saveNote, setNoteOpen, renameNote } from "@/lib/noteService";
 import { useWindowStateSaver, saveWindowState } from "@/lib/windowState";
 import { useGlobalStore } from "@/stores/globalStore";
 import { emitEvent, listenEvent } from "@/lib/events";
+import { useWindowGrouping } from "@/lib/useWindowGrouping";
 
 const DEBOUNCE_MS = 1000;
 const SAVED_DISPLAY_MS = 1500;
@@ -53,6 +54,7 @@ export function NoteWindow() {
 
   // Persist window position/size to SQLite on move/resize
   useWindowStateSaver(id, "notes");
+  const { isGrouped, snapPreview, ungroup, ungroupAll } = useWindowGrouping();
 
   const handleRename = useCallback(async (newName: string) => {
     if (!id) return;
@@ -250,6 +252,10 @@ export function NoteWindow() {
       title={displayTitle}
       onBeforeClose={handleClose}
       onRename={(name) => void handleRename(name)}
+      isGrouped={isGrouped}
+      onUngroup={isGrouped ? () => void ungroup() : undefined}
+      onUngroupAll={isGrouped ? () => void ungroupAll() : undefined}
+      snapPreview={snapPreview}
     >
       <Suspense fallback={<EditorFallback />} >
         <NoteEditor

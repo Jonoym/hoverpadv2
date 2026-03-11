@@ -4,11 +4,12 @@ import { currentMonitor } from "@tauri-apps/api/window";
 import { PhysicalSize, PhysicalPosition, LogicalSize, LogicalPosition } from "@tauri-apps/api/dpi";
 import { useShallow } from "zustand/react/shallow";
 import { cn } from "@/lib/utils";
-import { createNoteWindow, createSessionWindow, createSessionGroupWindow, createCustomGroupWindow, createLogFileWindow } from "@/lib/windowManager";
+import { createNoteWindow, createSessionWindow, createSessionGroupWindow, createCustomGroupWindow, createLogFileWindow, createClipboardWindow, createNotificationWindow } from "@/lib/windowManager";
 
 import { listNotes } from "@/lib/noteService";
 import { listenEvent } from "@/lib/events";
-import { discoverSessions, listOpenSessionGroups } from "@/lib/sessionService";
+import { discoverSessions, listOpenSessionGroups, invalidateSessionCache, startSessionWatcher, stopSessionWatcher, onSessionFileChanged, refreshSessionByPath } from "@/lib/sessionService";
+import { getClipboardWindowOpen, setClipboardWindowOpen } from "@/lib/settingsService";
 import { listOpenLogFiles } from "@/lib/logFileService";
 import { getDatabase } from "@/lib/database";
 import { useGlobalStore, selectOpenNoteCount } from "@/stores/globalStore";
@@ -16,6 +17,7 @@ import { WindowChrome } from "@/components/WindowChrome";
 import { NoteList } from "@/components/NoteList";
 import { SessionList } from "@/components/SessionList";
 import { KanbanBoard } from "@/components/kanban/KanbanBoard";
+import { JournalView } from "@/components/JournalView";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { CollapsedTab } from "@/components/CollapsedTab";
 
@@ -27,12 +29,13 @@ const VIEW_WIDTHS: Record<string, number> = {
   notes: 750,
   board: 1111,
   sessions: 500,
+  journal: 750,
 };
 
 
 export function ControlPanel() {
   // View switcher state
-  const [activeView, setActiveView] = useState<"notes" | "board" | "sessions">("notes");
+  const [activeView, setActiveView] = useState<"notes" | "board" | "sessions" | "journal">("notes");
   const [showSettings, setShowSettings] = useState(false);
 
   // Collapse/expand state
@@ -41,7 +44,7 @@ export function ControlPanel() {
   const [expandedPosition, setExpandedPosition] = useState<{ x: number; y: number } | null>(null);
 
   // Subscribe to global store
-  const { notes, notesLoading, refreshNotes, sessions, refreshSessions, hydrateSessions } = useGlobalStore(
+  const { notes, notesLoading, refreshNotes, sessions, refreshSessions, hydrateSessions, updateSessionLabel, upsertSessionInStore } = useGlobalStore(
     useShallow((s) => ({
       notes: s.notes,
       notesLoading: s.notesLoading,
@@ -49,6 +52,8 @@ export function ControlPanel() {
       sessions: s.sessions,
       refreshSessions: s.refreshSessions,
       hydrateSessions: s.hydrateSessions,
+      updateSessionLabel: s.updateSessionLabel,
+      upsertSessionInStore: s.upsertSessionInStore,
     })),
   );
   const noteCount = useGlobalStore(selectOpenNoteCount);
@@ -57,7 +62,7 @@ export function ControlPanel() {
   const childrenHidden = useGlobalStore((s) => s.childrenHidden);
   const isHidden = useGlobalStore((s) => s.isHidden);
 
-  const switchView = useCallback((view: "notes" | "board" | "sessions") => {
+  const switchView = useCallback((view: "notes" | "board" | "sessions" | "journal") => {
     setShowSettings(false);
     setActiveView(view);
     const appWindow = getCurrentWebviewWindow();
@@ -77,19 +82,36 @@ export function ControlPanel() {
     void refreshNotes();
     void refreshSessions();
 
-    // Poll sessions every 5s so status changes (running → idle) are picked up
-    const interval = setInterval(() => { void refreshSessions(); }, 5_000);
+    // Start the Rust file watcher and react to file changes in real time.
+    // Each changed file is refreshed individually for near-instant status updates.
+    void startSessionWatcher();
+    const unlistenWatcher = onSessionFileChanged(async (path) => {
+      const updated = await refreshSessionByPath(path);
+      if (updated) {
+        upsertSessionInStore(updated);
+      }
+    }, 300);
+
+    // Slow fallback poll (30s) for full discovery (new sessions, deleted files, etc.)
+    const interval = setInterval(() => { void refreshSessions(); }, 30_000);
 
     // Refresh immediately when renames happen in other windows
     const unlistenNote = listenEvent("note:renamed", () => { void refreshNotes(); });
-    const unlistenSession = listenEvent("session:renamed", () => { void refreshSessions(); });
+    const unlistenSession = listenEvent("session:renamed", (e) => {
+      // Synchronous in-memory patch — no async, no races
+      updateSessionLabel(e.payload.sessionId, e.payload.newLabel);
+      // Invalidate this window's cache so the next poll doesn't revert the label
+      invalidateSessionCache(e.payload.sessionId);
+    });
 
     return () => {
       clearInterval(interval);
+      void stopSessionWatcher();
+      unlistenWatcher.then((fn) => fn()).catch(console.error);
       unlistenNote.then((fn) => fn()).catch(console.error);
       unlistenSession.then((fn) => fn()).catch(console.error);
     };
-  }, [refreshNotes, refreshSessions, hydrateSessions]);
+  }, [refreshNotes, refreshSessions, hydrateSessions, updateSessionLabel, upsertSessionInStore]);
 
   // Restore previously open windows on app launch.
   // Module-level guard prevents duplicate restores from React StrictMode double-mount.
@@ -138,6 +160,17 @@ export function ControlPanel() {
         for (const lf of logFiles) {
           await createLogFileWindow(lf.id);
         }
+
+        // Restore clipboard window if it was open
+        const clipboardWasOpen = await getClipboardWindowOpen();
+        if (clipboardWasOpen) {
+          // Clear flag — ClipboardWindow re-sets on mount
+          await setClipboardWindowOpen(false);
+          await createClipboardWindow();
+        }
+
+        // Always launch the notification overlay (transparent, click-through)
+        await createNotificationWindow();
       } catch (err) {
         console.error("[hoverpad] Failed to restore windows:", err);
       }
@@ -202,8 +235,8 @@ export function ControlPanel() {
 
         if (state.expSize) setExpandedSize(state.expSize);
         if (state.expPosition) setExpandedPosition(state.expPosition);
-        if (state.view && ["notes", "board", "sessions"].includes(state.view)) {
-          setActiveView(state.view as "notes" | "board" | "sessions");
+        if (state.view && ["notes", "board", "sessions", "journal"].includes(state.view)) {
+          setActiveView(state.view as "notes" | "board" | "sessions" | "journal");
         }
 
         // Restore collapsed state — apply window geometry
@@ -219,7 +252,7 @@ export function ControlPanel() {
           setIsCollapsed(true);
         } else if (state.expSize) {
           // Apply view-specific width with saved height
-          const restoredView = (state.view && ["notes", "board", "sessions"].includes(state.view))
+          const restoredView = (state.view && ["notes", "board", "sessions", "journal"].includes(state.view))
             ? state.view
             : "notes";
           const targetWidth = VIEW_WIDTHS[restoredView] ?? VIEW_WIDTHS.notes!;
@@ -395,12 +428,45 @@ export function ControlPanel() {
           >
             Sessions
           </button>
+          <button
+            type="button"
+            onClick={() => switchView("journal")}
+            className={cn(
+              "border-b-2 pb-2 text-sm font-medium transition-colors duration-150 cursor-pointer",
+              activeView === "journal" && !showSettings
+                ? "border-blue-500 text-neutral-100"
+                : "border-transparent text-neutral-500 hover:text-neutral-300",
+            )}
+          >
+            Journal
+          </button>
         </div>
+        <div className="ml-auto flex items-center">
+        <button
+          type="button"
+          onClick={() => void createClipboardWindow()}
+          className="border-b-2 border-transparent px-2 pb-2 cursor-pointer transition-colors duration-150 text-neutral-500 hover:text-neutral-300"
+          title="Clipboard History (Ctrl+Shift+V)"
+        >
+          {/* Clipboard icon */}
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            className="h-4 w-4"
+          >
+            <path
+              fillRule="evenodd"
+              d="M13.887 3.182c.396.037.79.08 1.183.128C16.194 3.45 17 4.414 17 5.517V16.75A2.25 2.25 0 0 1 14.75 19h-9.5A2.25 2.25 0 0 1 3 16.75V5.517c0-1.103.806-2.068 1.93-2.207.393-.048.787-.09 1.183-.128A3.001 3.001 0 0 1 9 1h2c1.373 0 2.531.923 2.887 2.182ZM7.5 4A1.5 1.5 0 0 1 9 2.5h2A1.5 1.5 0 0 1 12.5 4v.5h-5V4Z"
+              clipRule="evenodd"
+            />
+          </svg>
+        </button>
         <button
           type="button"
           onClick={() => setShowSettings((prev) => !prev)}
           className={cn(
-            "ml-auto border-b-2 px-3 pb-2 cursor-pointer transition-colors duration-150",
+            "border-b-2 px-3 pb-2 cursor-pointer transition-colors duration-150",
             showSettings
               ? "border-blue-500 text-neutral-100"
               : "border-transparent text-neutral-500 hover:text-neutral-300",
@@ -420,6 +486,7 @@ export function ControlPanel() {
             />
           </svg>
         </button>
+        </div>
       </div>
 
       {/* Content area */}
@@ -438,6 +505,9 @@ export function ControlPanel() {
             </div>
             <div className={cn("flex-1 overflow-y-auto pr-2", activeView !== "sessions" && "hidden")}>
               <SessionList sessions={sessions} onRefresh={refreshSessions} />
+            </div>
+            <div className={cn("flex-1 overflow-y-auto pr-2", activeView !== "journal" && "hidden")}>
+              <JournalView />
             </div>
           </>
         )}

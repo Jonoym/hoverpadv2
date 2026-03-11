@@ -313,6 +313,7 @@ export function SessionList({ sessions, onRefresh }: SessionListProps) {
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
   const dragOverlayRef = useRef<HTMLDivElement>(null);
   const dragDataRef = useRef<{ sessionId: string; startX: number; startY: number; started: boolean } | null>(null);
+  const justDraggedRef = useRef(false);
   const groupDropRefs = useRef(new Map<string, HTMLDivElement>());
   const dragCleanupRef = useRef<(() => void) | null>(null);
   const scrollContainerRef = useRef<HTMLElement | null>(null);
@@ -575,14 +576,15 @@ export function SessionList({ sessions, onRefresh }: SessionListProps) {
     if (!renamingId) return;
     const trimmed = renameValue.trim();
     const label = trimmed && trimmed !== renamingId.slice(0, 8) ? trimmed : null;
+    setRenamingId(null);
     try {
+      // 1. Persist to DB + invalidate cache
       await renameSession(renamingId, label);
-      onRefresh?.();
+      // 2. Broadcast to all windows — listeners patch labels synchronously
       await emitEvent("session:renamed", { sessionId: renamingId, newLabel: label });
     } catch (err) {
       console.error("[hoverpad] Failed to rename session:", err);
     }
-    setRenamingId(null);
   };
 
   const handleDeleteProject = async (encodedDir: string) => {
@@ -749,6 +751,10 @@ export function SessionList({ sessions, onRefresh }: SessionListProps) {
         return;
       }
 
+      // Prevent the subsequent click event from opening the session window
+      justDraggedRef.current = true;
+      setTimeout(() => { justDraggedRef.current = false; }, 0);
+
       const targetGroup = getGroupAtPoint(ev.clientX, ev.clientY);
       dragDataRef.current = null;
       setDraggingSessionId(null);
@@ -888,9 +894,13 @@ export function SessionList({ sessions, onRefresh }: SessionListProps) {
     onContextMenu: (s: SessionMeta, x: number, y: number) => handleSessionContextMenu(s, x, y),
   };
 
-  // In custom view, sessions are draggable
+  // In custom view, sessions are draggable — wrap onWatch to ignore clicks after drag
   const projectRowProps = { ...baseRowProps };
-  const customRowProps = { ...baseRowProps, onDragStart: handleSessionDragStart };
+  const customRowProps = {
+    ...baseRowProps,
+    onWatch: (s: SessionMeta) => { if (!justDraggedRef.current) void handleWatch(s); },
+    onDragStart: handleSessionDragStart,
+  };
 
   // ---------- Render ----------
 

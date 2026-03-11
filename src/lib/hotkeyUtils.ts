@@ -11,6 +11,11 @@ export function keyEventToShortcutString(e: KeyboardEvent): string | null {
   if (parts.length === 0) return null;
 
   // Map key names
+  // Shifted number keys produce symbols — map them back to digits
+  const shiftedDigits: Record<string, string> = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+  };
   const keyMap: Record<string, string> = {
     ",": ",",
     ".": ".",
@@ -28,6 +33,7 @@ export function keyEventToShortcutString(e: KeyboardEvent): string | null {
     ArrowDown: "Down",
     ArrowLeft: "Left",
     ArrowRight: "Right",
+    ...shiftedDigits,
   };
 
   const keyName =
@@ -48,4 +54,11 @@ export const ACTION_LABELS: Record<string, string> = {
   "hide-children": "Hide Children",
   "opacity-decrease": "Decrease Opacity",
   "opacity-increase": "Increase Opacity",
+  "toggle-clipboard": "Toggle Clipboard",
+  "reopen-last-closed": "Reopen Last Closed",
+  "workspace-1": "Workspace Slot 1",
+  "workspace-2": "Workspace Slot 2",
+  "workspace-3": "Workspace Slot 3",
+  "workspace-4": "Workspace Slot 4",
+  "workspace-5": "Workspace Slot 5",
 };

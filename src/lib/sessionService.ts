@@ -1,6 +1,7 @@
 import { readDir, readTextFile, exists, remove } from "@tauri-apps/plugin-fs";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getDatabase } from "./database";
 
 // ---------------------------------------------------------------------------
@@ -309,8 +310,11 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
               status = "active";
               endedAt = null;
             } else {
-              // Stale progress — likely interrupted or crashed
-              status = "errored";
+              // Stale progress — session likely finished or was interrupted.
+              // Mark as completed, not errored: we can't distinguish a crash
+              // from a normal end when the turn_duration event is outside the
+              // tail window. True errors have explicit error system events.
+              status = "completed";
               endedAt = entry.timestamp;
             }
             break;
@@ -440,8 +444,6 @@ export async function discoverSessions(): Promise<SessionMeta[]> {
       }
 
       // Derive display status for stale sessions (completed/idle, last activity 30+ min ago)
-      // - Window open → show as "idle"
-      // - Window closed → show as "inactive"
       const INACTIVE_THRESHOLD_MS = 30 * 60 * 1000;
       const lastActivity = session.endedAt ?? session.startedAt;
       if (
@@ -960,29 +962,70 @@ export function parseSessionEvent(
 }
 
 // ---------------------------------------------------------------------------
-// Session tailing
+// Session tailing (event-driven via Rust file watcher)
 // ---------------------------------------------------------------------------
 
 interface TailState {
-  intervalId: ReturnType<typeof setInterval>;
+  /** Unlisten function for the file-changed event. */
+  unlisten: UnlistenFn;
+  /** Fallback poll interval (slow, 10s) in case watcher misses events. */
+  fallbackIntervalId: ReturnType<typeof setInterval>;
   lastLineCount: number;
   lastProgressEmit: number;
+  /** Full path to the .jsonl file being tailed. */
+  filePath: string;
+  /** Tool correlation queue. */
+  toolNameQueue: ToolQueueEntry[];
+  /** Callback for new events. */
+  onEvent: (event: SessionEvent) => void;
+  /** Session ID for this tail. */
+  sessionId: string;
+  /** Guard against concurrent reads. */
+  reading: boolean;
 }
 
 /** Map of sessionId -> tailing state for active tails. */
 const tailingState = new Map<string, TailState>();
+
+/** Read new lines from a tailed file and dispatch events. */
+async function readNewLines(state: TailState): Promise<void> {
+  if (state.reading) return;
+  state.reading = true;
+  try {
+    const newContent = await readTextFile(state.filePath);
+    const newLines = newContent.split("\n").filter(Boolean);
+
+    if (newLines.length <= state.lastLineCount) return;
+
+    const freshLines = newLines.slice(state.lastLineCount);
+    state.lastLineCount = newLines.length;
+
+    for (const line of freshLines) {
+      const event = parseSessionEvent(line, state.sessionId, state.toolNameQueue);
+      if (!event) continue;
+
+      if (event.type === "progress") {
+        const now = Date.now();
+        if (now - state.lastProgressEmit < 1000) continue;
+        state.lastProgressEmit = now;
+      }
+
+      state.onEvent(event);
+    }
+  } catch (err) {
+    console.warn(`[sessionService] Tailing read error for ${state.sessionId}:`, err);
+  } finally {
+    state.reading = false;
+  }
+}
 
 /**
  * Start tailing a session's JSONL log file. Calls `onEvent` for each
  * new event parsed from the file. Progress events are throttled to at
  * most one per second.
  *
- * The initial call processes all existing lines (for initial load),
- * then polls every 2 seconds for new lines appended to the file.
- *
- * @param sessionId - The UUID of the session to tail
- * @param encodedProjectDir - The encoded project directory name
- * @param onEvent - Callback invoked for each parsed event
+ * Uses the Rust file watcher for real-time notifications with a 10s
+ * fallback poll for robustness.
  */
 export async function startTailing(
   sessionId: string,
@@ -1026,8 +1069,6 @@ export async function startTailing(
 
   const lines = content.split("\n").filter(Boolean);
   let lastProgressEmit = 0;
-
-  // Queue to correlate tool info across events (assistant tool_use → user tool result)
   const toolNameQueue: ToolQueueEntry[] = [];
 
   // Process existing lines (initial load)
@@ -1035,7 +1076,6 @@ export async function startTailing(
     const event = parseSessionEvent(line, sessionId, toolNameQueue);
     if (!event) continue;
 
-    // Throttle progress events during initial load too
     if (event.type === "progress") {
       const eventTime = new Date(event.timestamp).getTime();
       if (eventTime - lastProgressEmit < 1000) continue;
@@ -1045,41 +1085,36 @@ export async function startTailing(
     onEvent(event);
   }
 
+  // Normalize path separators for comparison with watcher events
+  const normalizedPath = filePath.replace(/\\/g, "/").toLowerCase();
+
   const state: TailState = {
-    intervalId: 0 as unknown as ReturnType<typeof setInterval>,
+    unlisten: () => {},
+    fallbackIntervalId: 0 as unknown as ReturnType<typeof setInterval>,
     lastLineCount: lines.length,
     lastProgressEmit,
+    filePath,
+    toolNameQueue,
+    onEvent,
+    sessionId,
+    reading: false,
   };
 
-  // Start polling for new lines
-  state.intervalId = setInterval(async () => {
-    try {
-      const newContent = await readTextFile(filePath);
-      const newLines = newContent.split("\n").filter(Boolean);
-
-      if (newLines.length <= state.lastLineCount) return;
-
-      // Process only newly appended lines
-      const freshLines = newLines.slice(state.lastLineCount);
-      state.lastLineCount = newLines.length;
-
-      for (const line of freshLines) {
-        const event = parseSessionEvent(line, sessionId, toolNameQueue);
-        if (!event) continue;
-
-        // Throttle progress events to ~1 per second
-        if (event.type === "progress") {
-          const now = Date.now();
-          if (now - state.lastProgressEmit < 1000) continue;
-          state.lastProgressEmit = now;
-        }
-
-        onEvent(event);
+  // Listen for file-changed events from the Rust watcher
+  state.unlisten = await listen<{ path: string }>(
+    "session:file-changed",
+    (e) => {
+      const changedPath = e.payload.path.replace(/\\/g, "/").toLowerCase();
+      if (changedPath === normalizedPath) {
+        void readNewLines(state);
       }
-    } catch (err) {
-      console.warn(`[sessionService] Tailing poll error for ${sessionId}:`, err);
-    }
-  }, 500);
+    },
+  );
+
+  // Fallback poll every 10s (in case the watcher misses an event)
+  state.fallbackIntervalId = setInterval(() => {
+    void readNewLines(state);
+  }, 10_000);
 
   tailingState.set(sessionId, state);
 }
@@ -1090,7 +1125,8 @@ export async function startTailing(
 export function stopTailing(sessionId: string): void {
   const state = tailingState.get(sessionId);
   if (state) {
-    clearInterval(state.intervalId);
+    state.unlisten();
+    clearInterval(state.fallbackIntervalId);
     tailingState.delete(sessionId);
   }
 }
@@ -1151,8 +1187,8 @@ export async function discoverSubagentIds(
 const agentTailState = new Map<string, TailState>();
 
 /**
- * Start tailing a sub-agent's JSONL log file. Same approach as `startTailing`
- * but reads from `subagents/agent-{agentId}.jsonl` within the session directory.
+ * Start tailing a sub-agent's JSONL log file. Uses the Rust file watcher
+ * for real-time notifications with a 10s fallback poll.
  */
 export async function startAgentTailing(
   sessionId: string,
@@ -1196,7 +1232,6 @@ export async function startAgentTailing(
   for (const line of lines) {
     const event = parseSessionEvent(line, sessionId, toolNameQueue);
     if (!event) continue;
-    // Mark the first user message as the agent prompt
     if (!firstUserSeen && event.type === "user" && !event.isToolResult) {
       firstUserSeen = true;
       event.isAgentPrompt = true;
@@ -1210,35 +1245,35 @@ export async function startAgentTailing(
     onEvent(event);
   }
 
+  const normalizedPath = filePath.replace(/\\/g, "/").toLowerCase();
+
   const state: TailState = {
-    intervalId: 0 as unknown as ReturnType<typeof setInterval>,
+    unlisten: () => {},
+    fallbackIntervalId: 0 as unknown as ReturnType<typeof setInterval>,
     lastLineCount: lines.length,
     lastProgressEmit,
+    filePath,
+    toolNameQueue,
+    onEvent,
+    sessionId,
+    reading: false,
   };
 
-  state.intervalId = setInterval(async () => {
-    try {
-      const newContent = await readTextFile(filePath);
-      const newLines = newContent.split("\n").filter(Boolean);
-      if (newLines.length <= state.lastLineCount) return;
-
-      const freshLines = newLines.slice(state.lastLineCount);
-      state.lastLineCount = newLines.length;
-
-      for (const line of freshLines) {
-        const event = parseSessionEvent(line, sessionId, toolNameQueue);
-        if (!event) continue;
-        if (event.type === "progress") {
-          const now = Date.now();
-          if (now - state.lastProgressEmit < 1000) continue;
-          state.lastProgressEmit = now;
-        }
-        onEvent(event);
+  // Listen for file-changed events from the Rust watcher
+  state.unlisten = await listen<{ path: string }>(
+    "session:file-changed",
+    (e) => {
+      const changedPath = e.payload.path.replace(/\\/g, "/").toLowerCase();
+      if (changedPath === normalizedPath) {
+        void readNewLines(state);
       }
-    } catch (err) {
-      console.warn(`[sessionService] Agent tailing poll error for ${agentId}:`, err);
-    }
-  }, 500);
+    },
+  );
+
+  // Fallback poll every 10s
+  state.fallbackIntervalId = setInterval(() => {
+    void readNewLines(state);
+  }, 10_000);
 
   agentTailState.set(agentId, state);
 }
@@ -1249,7 +1284,8 @@ export async function startAgentTailing(
 export function stopAgentTailing(agentId: string): void {
   const state = agentTailState.get(agentId);
   if (state) {
-    clearInterval(state.intervalId);
+    state.unlisten();
+    clearInterval(state.fallbackIntervalId);
     agentTailState.delete(agentId);
   }
 }
@@ -1376,6 +1412,25 @@ export async function renameSession(
     label,
     sessionId,
   ]);
+  invalidateSessionCache(sessionId);
+}
+
+/**
+ * Remove a session from the mtime cache so the next discoverSessions()
+ * re-reads from DB instead of returning stale cached data.
+ *
+ * IMPORTANT: The sessionCache is per-window (each Tauri window has its own
+ * JS module scope). renameSession() only invalidates the calling window's
+ * cache. Other windows must call this explicitly when they receive a
+ * "session:renamed" event so their next poll doesn't return a stale label.
+ */
+export function invalidateSessionCache(sessionId: string): void {
+  for (const [path, entry] of sessionCache) {
+    if (entry.meta.id === sessionId) {
+      sessionCache.delete(path);
+      break;
+    }
+  }
 }
 
 /**
@@ -1648,6 +1703,7 @@ export async function addSessionToGroup(
     "INSERT OR IGNORE INTO session_group_members (session_id, group_id) VALUES ($1, $2)",
     [sessionId, groupId],
   );
+  invalidateSessionCache(sessionId);
 }
 
 /**
@@ -1662,6 +1718,7 @@ export async function removeSessionFromGroup(
     "DELETE FROM session_group_members WHERE session_id = $1 AND group_id = $2",
     [sessionId, groupId],
   );
+  invalidateSessionCache(sessionId);
 }
 
 /**
@@ -1672,4 +1729,291 @@ export async function removeSessionFromAllGroups(
 ): Promise<void> {
   const db = await getDatabase();
   await db.execute("DELETE FROM session_group_members WHERE session_id = $1", [sessionId]);
+  invalidateSessionCache(sessionId);
+}
+
+// ---------------------------------------------------------------------------
+// Rust file watcher control
+// ---------------------------------------------------------------------------
+
+/** Start the Rust-side file watcher for `~/.claude/projects/`. */
+export async function startSessionWatcher(): Promise<void> {
+  try {
+    await invoke("start_session_watcher");
+  } catch (err) {
+    console.warn("[sessionService] Failed to start session watcher:", err);
+  }
+}
+
+/** Stop the Rust-side file watcher. */
+export async function stopSessionWatcher(): Promise<void> {
+  try {
+    await invoke("stop_session_watcher");
+  } catch (err) {
+    console.warn("[sessionService] Failed to stop session watcher:", err);
+  }
+}
+
+/**
+ * Subscribe to session file changes and trigger a callback with the path.
+ * Returns an unlisten function. The callback is debounced per-path so that
+ * rapid changes to the same file coalesce, but different files update independently.
+ */
+export async function onSessionFileChanged(
+  callback: (path: string) => void,
+  debounceMs = 300,
+): Promise<UnlistenFn> {
+  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  return listen<{ path: string }>("session:file-changed", (e) => {
+    const path = e.payload.path;
+    const existing = timers.get(path);
+    if (existing) clearTimeout(existing);
+    timers.set(
+      path,
+      setTimeout(() => {
+        timers.delete(path);
+        callback(path);
+      }, debounceMs),
+    );
+  });
+}
+
+/**
+ * UUID regex for validating session IDs extracted from file paths.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Fast targeted refresh for a single session file.
+ * Extracts session ID and project dir from the file path, reads only that
+ * file's head+tail, recomputes status, and returns the updated SessionMeta.
+ * Returns null if the path doesn't match a valid session file.
+ */
+export async function refreshSessionByPath(filePath: string): Promise<SessionMeta | null> {
+  // Normalize to forward slashes for parsing
+  const normalized = filePath.replace(/\\/g, "/");
+
+  // Expected structure: .../.claude/projects/<encodedProjectDir>/<sessionId>.jsonl
+  // Also handle subagent paths: .../<sessionId>/subagents/agent-<id>.jsonl (skip these)
+  const match = normalized.match(/\/\.claude\/projects\/([^/]+)\/([^/]+)\.jsonl$/);
+  if (!match) return null;
+
+  const encodedProjectDir = match[1]!;
+  const sessionId = match[2]!;
+
+  // Must be a valid UUID
+  if (!UUID_RE.test(sessionId)) return null;
+
+  const projectDir = decodeProjectPath(encodedProjectDir);
+
+  // Read head + tail
+  let headTail: HeadTailResult;
+  try {
+    headTail = await readFileHeadTail(filePath, 20, 10);
+  } catch {
+    return null;
+  }
+
+  // Update mtime cache
+  const cached = sessionCache.get(filePath);
+  if (
+    cached &&
+    cached.mtimeMs === headTail.mtimeMs &&
+    (cached.meta.status === "completed" || cached.meta.status === "errored")
+  ) {
+    return cached.meta;
+  }
+
+  const headLines = headTail.headLines;
+  const tailLines = headTail.tailLines;
+  if (headLines.length === 0) return null;
+
+  // Extract start time and working dir from head
+  let startedAt: string | null = null;
+  let workingDir: string | null = null;
+
+  for (const line of headLines) {
+    try {
+      const entry = JSON.parse(line) as Record<string, unknown>;
+      if (entry.timestamp && typeof entry.timestamp === "string") {
+        if (!startedAt) startedAt = entry.timestamp;
+        if (!workingDir && entry.cwd && typeof entry.cwd === "string") {
+          workingDir = entry.cwd;
+        }
+        if (startedAt && workingDir) break;
+      }
+      if (
+        !startedAt &&
+        entry.type === "file-history-snapshot" &&
+        entry.snapshot &&
+        typeof entry.snapshot === "object"
+      ) {
+        const snapshot = entry.snapshot as Record<string, unknown>;
+        if (snapshot.timestamp && typeof snapshot.timestamp === "string") {
+          startedAt = snapshot.timestamp;
+        }
+      }
+    } catch {
+      // skip
+    }
+  }
+
+  if (!startedAt) return null;
+
+  // Determine status from tail
+  let endedAt: string | null = null;
+  let status: "active" | "completed" | "errored" | "idle" = "completed";
+
+  for (let i = tailLines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(tailLines[i]!) as Record<string, unknown>;
+      if (!entry.timestamp || typeof entry.timestamp !== "string") continue;
+
+      const entryTime = new Date(entry.timestamp).getTime();
+      const ageMs = Date.now() - entryTime;
+      const entryType = entry.type as string | undefined;
+
+      if (entryType === "system") {
+        const subtype = entry.subtype as string | undefined;
+        if (subtype === "turn_duration") {
+          status = "completed";
+          endedAt = entry.timestamp;
+          break;
+        }
+      }
+      if (entryType === "assistant") {
+        status = "completed";
+        endedAt = entry.timestamp;
+        break;
+      }
+      if (entryType === "progress") {
+        if (ageMs < 15_000) {
+          status = "active";
+          endedAt = null;
+        } else {
+          status = "completed";
+          endedAt = entry.timestamp;
+        }
+        break;
+      }
+      if (entryType === "user") {
+        if (ageMs < 15_000) {
+          status = "active";
+          endedAt = null;
+        } else {
+          status = "idle";
+          endedAt = null;
+        }
+        break;
+      }
+      if (entryType === "file-history-snapshot") continue;
+
+      endedAt = entry.timestamp;
+      break;
+    } catch {
+      // skip
+    }
+  }
+
+  // Extract last user message
+  let lastUserMessage: string | null = null;
+  for (let i = tailLines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(tailLines[i]!) as Record<string, unknown>;
+      if (entry.type !== "user") continue;
+      if (entry.toolUseResult) continue;
+      if (entry.isMeta) continue;
+      const message = entry.message as { content?: string | unknown[] } | undefined;
+      if (!message?.content) continue;
+      if (Array.isArray(message.content)) {
+        const hasToolResult = message.content.some(
+          (c) => typeof c === "object" && c !== null && (c as Record<string, unknown>).type === "tool_result",
+        );
+        if (hasToolResult) continue;
+      }
+      const text =
+        typeof message.content === "string"
+          ? message.content
+          : Array.isArray(message.content)
+            ? message.content
+                .map((c) =>
+                  typeof c === "object" && c !== null && "text" in c
+                    ? (c as { text: string }).text
+                    : "",
+                )
+                .join("")
+            : null;
+      if (text && text.trim()) {
+        lastUserMessage = text.trim().slice(0, 200);
+        break;
+      }
+    } catch {
+      // skip
+    }
+  }
+
+  if (!workingDir) workingDir = projectDir;
+
+  const session: SessionMeta = {
+    id: sessionId,
+    sessionId,
+    projectDir,
+    encodedProjectDir,
+    startedAt,
+    endedAt,
+    status,
+    workingDir,
+    projectGroupId: null,
+    manualGroupIds: [],
+    ticketIds: [],
+    label: null,
+    isOpen: false,
+    lastUserMessage,
+  };
+
+  // Enrich from DB
+  try {
+    const groupId = await ensureProjectGroup(workingDir);
+    session.projectGroupId = groupId;
+    await upsertSession(session);
+    const db = await getDatabase();
+    const userRows = await db.select<{ label: string | null; is_open: number; last_user_message: string | null }[]>(
+      "SELECT label, is_open, last_user_message FROM sessions WHERE id = $1",
+      [sessionId],
+    );
+    if (userRows.length > 0) {
+      if (userRows[0]!.label) session.label = userRows[0]!.label;
+      session.isOpen = userRows[0]!.is_open === 1;
+      if (!session.lastUserMessage && userRows[0]!.last_user_message) {
+        session.lastUserMessage = userRows[0]!.last_user_message;
+      }
+    }
+    const ticketRows = await db.select<{ ticket_id: string }[]>(
+      "SELECT ticket_id FROM session_tickets WHERE session_id = $1",
+      [sessionId],
+    );
+    session.ticketIds = ticketRows.map((r) => r.ticket_id);
+    const groupRows = await db.select<{ group_id: string }[]>(
+      "SELECT group_id FROM session_group_members WHERE session_id = $1",
+      [sessionId],
+    );
+    session.manualGroupIds = groupRows.map((r) => r.group_id);
+  } catch {
+    // best effort
+  }
+
+  // Inactive threshold
+  const INACTIVE_THRESHOLD_MS = 30 * 60 * 1000;
+  const lastActivity = session.endedAt ?? session.startedAt;
+  if (
+    (session.status === "completed" || session.status === "idle") &&
+    Date.now() - new Date(lastActivity).getTime() > INACTIVE_THRESHOLD_MS
+  ) {
+    session.status = session.isOpen ? "idle" : "inactive";
+  }
+
+  // Update cache
+  sessionCache.set(filePath, { mtimeMs: headTail.mtimeMs, meta: session });
+
+  return session;
 }

@@ -7,7 +7,7 @@ import {
 import { useParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { useWindowStateSaver, saveWindowState } from "@/lib/windowState";
-import { emitEvent } from "@/lib/events";
+import { emitEvent, listenEvent } from "@/lib/events";
 import { WindowChrome } from "@/components/WindowChrome";
 import {
   SessionTimeline,
@@ -23,11 +23,13 @@ import {
   discoverSubagentIds,
   discoverSessions,
   renameSession,
+  invalidateSessionCache,
   setSessionOpen,
   type SessionEvent,
   type SessionMeta,
 } from "@/lib/sessionService";
 import { invoke } from "@tauri-apps/api/core";
+import { useWindowGrouping } from "@/lib/useWindowGrouping";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -97,6 +99,7 @@ export function SessionWindow() {
   // Global store — look up the session metadata for encodedProjectDir
   const sessions = useGlobalStore((s) => s.sessions);
   const refreshSessions = useGlobalStore((s) => s.refreshSessions);
+  const updateSessionLabel = useGlobalStore((s) => s.updateSessionLabel);
   const setSessionStatus = useGlobalStore((s) => s.setSessionStatus);
   const clearSessionStatus = useGlobalStore((s) => s.clearSessionStatus);
 
@@ -112,15 +115,21 @@ export function SessionWindow() {
     }
   }, [sessionId, status, events, setSessionStatus]);
 
-  // Flash the window border when status transitions to completed/errored
+  // Flash the window border + notify when status transitions to completed/errored
   const prevStatusRef = useRef<SessionStatus>(status);
   useEffect(() => {
     const prev = prevStatusRef.current;
     prevStatusRef.current = status;
     if (prev === status) return;
-    const flashColor = statusFlashColor[status];
-    if (flashColor && sessionId) {
-      emitEvent("window:flash", { label: `session-${sessionId}`, color: flashColor }).catch(console.error);
+    if ((status === "completed" || status === "errored") && sessionId) {
+      const flashColor = statusFlashColor[status];
+      if (flashColor) {
+        emitEvent("window:flash", { label: `session-${sessionId}`, color: flashColor }).catch(console.error);
+      }
+      // Notify the notification window
+      const meta = useGlobalStore.getState().sessions.find((s) => s.sessionId === sessionId);
+      const label = meta?.label || meta?.lastUserMessage?.slice(0, 60) || sessionId.slice(0, 8);
+      emitEvent("session:notify", { sessionId, label, status }).catch(console.error);
     }
   }, [status, sessionId]);
 
@@ -131,6 +140,20 @@ export function SessionWindow() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  // ------------------------------------------------------------------
+  // Listen for renames from other windows so our title stays in sync
+  // ------------------------------------------------------------------
+
+  useEffect(() => {
+    const unlisten = listenEvent("session:renamed", (e) => {
+      // Synchronous in-memory patch — no async refresh needed
+      updateSessionLabel(e.payload.sessionId, e.payload.newLabel);
+      // Invalidate this window's cache so the next poll doesn't revert the label
+      invalidateSessionCache(e.payload.sessionId);
+    });
+    return () => { unlisten.then((fn) => fn()).catch(console.error); };
+  }, [updateSessionLabel]);
 
   // ------------------------------------------------------------------
   // Idle detection
@@ -506,16 +529,30 @@ export function SessionWindow() {
   // Rename handler
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // Rename handler
+  // ------------------------------------------------------------------
+
   const handleRename = useCallback(async (newName: string) => {
     if (!sessionId) return;
+    const label = newName || null;
+    // 1. Synchronous store patch — title updates immediately, no flicker
+    updateSessionLabel(sessionId, label);
     try {
-      await renameSession(sessionId, newName || null);
-      await refreshSessions();
-      await emitEvent("session:renamed", { sessionId, newLabel: newName || null });
+      // 2. Persist to DB + invalidate cache
+      await renameSession(sessionId, label);
+      // 3. Broadcast to other windows
+      await emitEvent("session:renamed", { sessionId, newLabel: label });
     } catch (err) {
       console.error("[hoverpad] Failed to rename session:", err);
     }
-  }, [sessionId, refreshSessions]);
+  }, [sessionId, updateSessionLabel]);
+
+  // ------------------------------------------------------------------
+  // Window grouping (drag-snap auto-group/ungroup)
+  // ------------------------------------------------------------------
+
+  const { isGrouped, snapPreview, ungroup: handleUngroup, ungroupAll: handleUngroupAll } = useWindowGrouping();
 
   // ------------------------------------------------------------------
   // Derive display values
@@ -541,6 +578,10 @@ export function SessionWindow() {
       statusDot={{ color: statusDotColor[displayStatus] }}
       onBeforeClose={handleBeforeClose}
       onRename={(name) => void handleRename(name)}
+      isGrouped={isGrouped}
+      onUngroup={isGrouped ? () => void handleUngroup() : undefined}
+      onUngroupAll={isGrouped ? () => void handleUngroupAll() : undefined}
+      snapPreview={snapPreview}
     >
       {/* Controls bar */}
       <div

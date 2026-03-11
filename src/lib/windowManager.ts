@@ -1,9 +1,11 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { availableMonitors, currentMonitor } from "@tauri-apps/api/window";
-import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
+import { currentMonitor } from "@tauri-apps/api/window";
+import { PhysicalPosition, PhysicalSize, LogicalPosition } from "@tauri-apps/api/dpi";
 import { emitEvent } from "./events";
 import { loadWindowState, type WindowState } from "./windowState";
 import { getDatabase } from "./database";
+import { getMonitors, monitorByName, monitorAt } from "./monitorUtils";
+import { getClipboardWindowState } from "./settingsService";
 
 /** Default logical size for new windows (no saved state). */
 const DEFAULT_WIDTH = 600;
@@ -21,37 +23,49 @@ function getBaseUrl(): string {
 
 /**
  * Validate a saved window position against current monitor bounds.
- * If the position is off-screen (e.g. monitor disconnected), returns a
- * centered fallback on the primary monitor. Otherwise returns as-is.
+ *
+ * Strategy:
+ * 1. If the saved position is still on-screen, use it as-is.
+ * 2. If the saved monitor name matches a current monitor, translate the
+ *    window's relative position to that monitor (handles monitor rearrangement).
+ * 3. Otherwise, center on the primary monitor.
  */
 async function validateWindowState(
   state: WindowState,
 ): Promise<WindowState> {
   try {
-    const monitors = await availableMonitors();
+    const monitors = await getMonitors();
     if (monitors.length === 0) return state;
 
-    // Check if the window's top-left corner is within any monitor
-    const isOnScreen = monitors.some((m) => {
-      const mx = m.position.x;
-      const my = m.position.y;
-      const mw = m.size.width;
-      const mh = m.size.height;
-      return state.x >= mx && state.x < mx + mw && state.y >= my && state.y < my + mh;
-    });
+    // 1. Check if position is still on-screen — use as-is
+    const currentMon = monitorAt(monitors, state.x, state.y);
+    if (currentMon) return state;
 
-    if (isOnScreen) return state;
+    // 2. Try to find the saved monitor by name and translate position
+    if (state.monitorName) {
+      const savedMon = monitorByName(monitors, state.monitorName);
+      if (savedMon) {
+        // Clamp within the target monitor bounds
+        const x = Math.max(
+          savedMon.x,
+          Math.min(savedMon.x + savedMon.width - state.width, state.x),
+        );
+        const y = Math.max(
+          savedMon.y,
+          Math.min(savedMon.y + savedMon.height - state.height, state.y),
+        );
+        return { ...state, x, y };
+      }
+    }
 
-    // Off-screen — center on primary monitor (first in list)
+    // 3. Off-screen and monitor not found — center on primary
     const primary = monitors[0]!;
     return {
-      x: primary.position.x + Math.round((primary.size.width - state.width) / 2),
-      y: primary.position.y + Math.round((primary.size.height - state.height) / 2),
-      width: state.width,
-      height: state.height,
+      ...state,
+      x: primary.x + Math.round((primary.width - state.width) / 2),
+      y: primary.y + Math.round((primary.height - state.height) / 2),
     };
   } catch {
-    // If monitor detection fails, use the saved state as-is
     return state;
   }
 }
@@ -65,7 +79,7 @@ interface WindowConfig {
   height?: number;
   minWidth?: number;
   minHeight?: number;
-  windowType: "note" | "session" | "session-group" | "logfile";
+  windowType: "note" | "session" | "session-group" | "logfile" | "clipboard" | "notifications";
   savedState?: WindowState | null;
 }
 
@@ -110,13 +124,20 @@ async function createWindow(config: WindowConfig): Promise<void> {
         shadow: false,
         alwaysOnTop: true,
         skipTaskbar: true,
+        maximizable: false,
         title: `Hoverpad - ${windowType} ${label}`,
       });
 
       webview.once("tauri://created", async () => {
         try {
           if (finalSavedState) {
-            await webview.setSize(new PhysicalSize(finalSavedState.width, finalSavedState.height));
+            // Enforce minimum dimensions — saved state may be smaller than current minimums
+            const scale = (await currentMonitor())?.scaleFactor ?? 1;
+            const minW = minWidth ? Math.round(minWidth * scale) : 0;
+            const minH = minHeight ? Math.round(minHeight * scale) : 0;
+            const w = Math.max(finalSavedState.width, minW);
+            const h = Math.max(finalSavedState.height, minH);
+            await webview.setSize(new PhysicalSize(w, h));
             await webview.setPosition(new PhysicalPosition(finalSavedState.x, finalSavedState.y));
           } else {
             const monitor = await currentMonitor();
@@ -270,4 +291,96 @@ export async function createSessionWindow(sessionId: string): Promise<void> {
     windowType: "session",
     savedState,
   });
+}
+
+/**
+ * Create (or focus) the singleton clipboard history window.
+ */
+export async function createClipboardWindow(): Promise<void> {
+  const label = "clipboard";
+  const baseUrl = getBaseUrl();
+  const url = `${baseUrl}/clipboard`;
+
+  // Load saved window state from settings
+  const saved = await getClipboardWindowState();
+  const savedState: WindowState | null = saved
+    ? { x: saved.x, y: saved.y, width: saved.width, height: saved.height }
+    : null;
+
+  await createWindow({
+    label,
+    url,
+    width: 400,
+    height: 600,
+    minWidth: 300,
+    minHeight: 400,
+    windowType: "clipboard",
+    savedState,
+  });
+}
+
+const NOTIF_WIDTH = 340;
+const NOTIF_HEIGHT = 200;
+
+/**
+ * Create (or focus) the singleton notification overlay window.
+ * Positioned at bottom-right of the primary monitor. Transparent, frameless,
+ * always-on-top, click-through by default (the window manages its own cursor events).
+ */
+export async function createNotificationWindow(): Promise<void> {
+  const label = "notifications";
+
+  // Don't duplicate
+  const existing = await WebviewWindow.getByLabel(label);
+  if (existing) return;
+  if (pendingWindows.has(label)) return;
+  pendingWindows.add(label);
+
+  const baseUrl = getBaseUrl();
+  const url = `${baseUrl}/notifications`;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const webview = new WebviewWindow(label, {
+        url,
+        width: NOTIF_WIDTH,
+        height: NOTIF_HEIGHT,
+        transparent: true,
+        decorations: false,
+        shadow: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        maximizable: false,
+        resizable: false,
+        title: "Hoverpad Notifications",
+      });
+
+      webview.once("tauri://created", async () => {
+        try {
+          // Position at bottom-right of primary monitor
+          const monitor = await currentMonitor();
+          if (monitor) {
+            const scale = monitor.scaleFactor;
+            const screenW = monitor.size.width / scale;
+            const screenH = monitor.size.height / scale;
+            const x = screenW - NOTIF_WIDTH - 8;
+            const y = screenH - NOTIF_HEIGHT - 60;
+            await webview.setPosition(new LogicalPosition(x, y));
+          }
+          // Start click-through — the window toggles this when toasts appear
+          await webview.setIgnoreCursorEvents(true);
+        } catch (err) {
+          console.error("[hoverpad] Failed to position notification window:", err);
+        }
+        resolve();
+      });
+
+      webview.once("tauri://error", (e) => {
+        console.error("Failed to create notification window:", e);
+        reject(e);
+      });
+    });
+  } finally {
+    pendingWindows.delete(label);
+  }
 }

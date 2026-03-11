@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
 import {
@@ -13,11 +13,40 @@ import {
   formatShortcutDisplay,
   ACTION_LABELS,
 } from "@/lib/hotkeyUtils";
+import {
+  getMonitors,
+  monitorLabel,
+  sendAllWindowsToMonitor,
+  sendControlPanelToMonitor,
+  type MonitorInfo,
+} from "@/lib/monitorUtils";
+import {
+  listWorkspaceProfiles,
+  captureWorkspace,
+  restoreWorkspace,
+  deleteWorkspaceProfile,
+  renameWorkspaceProfile,
+  getAllSlotAssignments,
+  setSlotProfileId,
+  MAX_WORKSPACE_SLOTS,
+} from "@/lib/workspaceService";
 
 export function SettingsPanel() {
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [capturingAction, setCapturingAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+  const [monitorBusy, setMonitorBusy] = useState<number | null>(null);
+
+  // Workspace profiles state
+  const [profiles, setProfiles] = useState<{ id: string; name: string; createdAt: string }[]>([]);
+  const [newProfileName, setNewProfileName] = useState("");
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [restoringProfile, setRestoringProfile] = useState<string | null>(null);
+  const [renamingProfile, setRenamingProfile] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const [slotAssignments, setSlotAssignments] = useState<Record<number, string>>({});
 
   const defaults = getDefaultHotkeys();
 
@@ -33,6 +62,113 @@ export function SettingsPanel() {
   useEffect(() => {
     void loadBindings();
   }, [loadBindings]);
+
+  // Load available monitors
+  const loadMonitors = useCallback(async () => {
+    try {
+      const m = await getMonitors();
+      setMonitors(m);
+    } catch (err) {
+      console.error("[hoverpad] Failed to load monitors:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadMonitors();
+  }, [loadMonitors]);
+
+  // Load workspace profiles and slot assignments
+  const loadProfiles = useCallback(async () => {
+    try {
+      const [p, slots] = await Promise.all([
+        listWorkspaceProfiles(),
+        getAllSlotAssignments(),
+      ]);
+      setProfiles(p);
+      setSlotAssignments(slots);
+    } catch (err) {
+      console.error("[hoverpad] Failed to load workspace profiles:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadProfiles();
+  }, [loadProfiles]);
+
+  // Focus rename input when entering rename mode
+  useEffect(() => {
+    if (renamingProfile && renameInputRef.current) {
+      renameInputRef.current.focus();
+      renameInputRef.current.select();
+    }
+  }, [renamingProfile]);
+
+  const handleSaveProfile = async () => {
+    const name = newProfileName.trim();
+    if (!name) return;
+    setSavingProfile(true);
+    try {
+      await captureWorkspace(name);
+      setNewProfileName("");
+      await loadProfiles();
+    } catch (err) {
+      console.error("[hoverpad] Failed to save workspace profile:", err);
+    }
+    setSavingProfile(false);
+  };
+
+  const handleRestoreProfile = async (id: string) => {
+    setRestoringProfile(id);
+    try {
+      await restoreWorkspace(id);
+    } catch (err) {
+      console.error("[hoverpad] Failed to restore workspace:", err);
+    }
+    setRestoringProfile(null);
+  };
+
+  const handleDeleteProfile = async (id: string) => {
+    try {
+      await deleteWorkspaceProfile(id);
+      await loadProfiles();
+    } catch (err) {
+      console.error("[hoverpad] Failed to delete workspace profile:", err);
+    }
+  };
+
+  const handleSlotChange = async (profileId: string, slot: number | null) => {
+    try {
+      // Clear any existing assignment for this profile
+      for (const [s, pid] of Object.entries(slotAssignments)) {
+        if (pid === profileId) {
+          await setSlotProfileId(Number(s), null);
+        }
+      }
+      // Assign the new slot
+      if (slot !== null) {
+        // Clear existing profile in this slot
+        await setSlotProfileId(slot, profileId);
+      }
+      await loadProfiles();
+    } catch (err) {
+      console.error("[hoverpad] Failed to update slot assignment:", err);
+    }
+  };
+
+  const handleRenameProfile = async (id: string) => {
+    const name = renameValue.trim();
+    if (!name) {
+      setRenamingProfile(null);
+      return;
+    }
+    try {
+      await renameWorkspaceProfile(id, name);
+      setRenamingProfile(null);
+      await loadProfiles();
+    } catch (err) {
+      console.error("[hoverpad] Failed to rename workspace profile:", err);
+    }
+  };
 
   // Temporarily unregister all global hotkeys while capturing, so the OS-level
   // shortcuts don't fire and steal the key combo from our capture handler.
@@ -291,6 +427,243 @@ export function SettingsPanel() {
           Reset All to Defaults
         </button>
       </div>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Multi-Monitor                                                       */}
+      {/* ------------------------------------------------------------------ */}
+      {monitors.length > 1 && (
+        <>
+          <div className="mt-2 border-t border-zinc-700/50 pt-4">
+            <h2 className="text-sm font-semibold text-zinc-100">
+              Monitors
+            </h2>
+            <p className="mt-1 text-xs text-zinc-500">
+              Send all open windows to a monitor.
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            {monitors.map((mon, i) => (
+              <div
+                key={mon.name ?? i}
+                className={cn(
+                  "flex items-center justify-between rounded-lg px-3 py-2",
+                  "border border-zinc-700/50 bg-zinc-900/50",
+                )}
+              >
+                <div className="flex flex-col">
+                  <span className="text-sm text-zinc-300">
+                    {monitorLabel(mon, i)}
+                  </span>
+                  <span className="text-xs text-zinc-500">
+                    {Math.round(mon.width / mon.scaleFactor)} &times; {Math.round(mon.height / mon.scaleFactor)}
+                    {mon.scaleFactor !== 1 && ` (${Math.round(mon.scaleFactor * 100)}% scale)`}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={monitorBusy !== null}
+                    onClick={async () => {
+                      setMonitorBusy(i);
+                      try {
+                        await sendAllWindowsToMonitor(mon);
+                        await sendControlPanelToMonitor(mon);
+                      } catch (err) {
+                        console.error("[hoverpad] Failed to move windows:", err);
+                      }
+                      setMonitorBusy(null);
+                    }}
+                    className={cn(
+                      "rounded px-2 py-1 text-xs font-medium transition-colors",
+                      "border border-zinc-600 bg-zinc-800 text-zinc-300",
+                      monitorBusy === i
+                        ? "opacity-50"
+                        : "hover:bg-zinc-700 hover:text-zinc-100",
+                    )}
+                  >
+                    {monitorBusy === i ? "Moving..." : "Send all here"}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void loadMonitors()}
+            className="self-end text-xs text-zinc-500 transition-colors hover:text-zinc-300"
+          >
+            Refresh monitors
+          </button>
+        </>
+      )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Workspace Profiles                                                  */}
+      {/* ------------------------------------------------------------------ */}
+      <div className="mt-2 border-t border-zinc-700/50 pt-4">
+        <h2 className="text-sm font-semibold text-zinc-100">
+          Workspace Profiles
+        </h2>
+        <p className="mt-1 text-xs text-zinc-500">
+          Save and restore window arrangements.
+        </p>
+      </div>
+
+      {/* Save new profile */}
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={newProfileName}
+          onChange={(e) => setNewProfileName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void handleSaveProfile();
+          }}
+          placeholder="Profile name..."
+          className={cn(
+            "flex-1 rounded-lg border border-zinc-700/50 bg-zinc-900/50 px-3 py-1.5",
+            "text-sm text-zinc-200 placeholder-zinc-600",
+            "outline-none focus:border-blue-500/50",
+          )}
+        />
+        <button
+          type="button"
+          disabled={!newProfileName.trim() || savingProfile}
+          onClick={() => void handleSaveProfile()}
+          className={cn(
+            "rounded-lg px-3 py-1.5 text-xs font-medium",
+            "border border-zinc-600 bg-zinc-800 text-zinc-300",
+            "transition-colors hover:bg-zinc-700 hover:text-zinc-100",
+            "disabled:opacity-40 disabled:cursor-not-allowed",
+          )}
+        >
+          {savingProfile ? "Saving..." : "Save Current"}
+        </button>
+      </div>
+
+      {/* Profile list */}
+      {profiles.length > 0 && (
+        <div className="flex flex-col gap-1">
+          {profiles.map((profile) => (
+            <div
+              key={profile.id}
+              className={cn(
+                "flex items-center justify-between rounded-lg px-3 py-2",
+                "border border-zinc-700/50 bg-zinc-900/50",
+              )}
+            >
+              <div className="flex flex-col min-w-0 flex-1">
+                {renamingProfile === profile.id ? (
+                  <input
+                    ref={renameInputRef}
+                    type="text"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") void handleRenameProfile(profile.id);
+                      if (e.key === "Escape") setRenamingProfile(null);
+                    }}
+                    onBlur={() => void handleRenameProfile(profile.id)}
+                    className={cn(
+                      "rounded border border-blue-500/50 bg-zinc-800 px-2 py-0.5",
+                      "text-sm text-zinc-200 outline-none",
+                    )}
+                  />
+                ) : (
+                  <span className="text-sm text-zinc-300 truncate">
+                    {profile.name}
+                  </span>
+                )}
+                <span className="text-xs text-zinc-600">
+                  {new Date(profile.createdAt).toLocaleDateString()}
+                  {(() => {
+                    const slot = Object.entries(slotAssignments).find(
+                      ([, pid]) => pid === profile.id,
+                    );
+                    return slot ? ` · Ctrl+Shift+${slot[0]}` : "";
+                  })()}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1 ml-2 shrink-0">
+                <select
+                  value={
+                    Object.entries(slotAssignments).find(
+                      ([, pid]) => pid === profile.id,
+                    )?.[0] ?? ""
+                  }
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    void handleSlotChange(
+                      profile.id,
+                      val ? Number(val) : null,
+                    );
+                  }}
+                  className={cn(
+                    "rounded border border-zinc-700/50 bg-zinc-800 px-1 py-0.5",
+                    "text-xs text-zinc-400 outline-none cursor-pointer",
+                    "hover:border-zinc-600 focus:border-blue-500/50",
+                  )}
+                  title="Assign to hotkey slot"
+                >
+                  <option value="">Slot</option>
+                  {Array.from({ length: MAX_WORKSPACE_SLOTS }, (_, i) => i + 1).map(
+                    (slot) => {
+                      const taken =
+                        slotAssignments[slot] &&
+                        slotAssignments[slot] !== profile.id;
+                      return (
+                        <option key={slot} value={slot} disabled={!!taken}>
+                          {slot}{taken ? " (used)" : ""}
+                        </option>
+                      );
+                    },
+                  )}
+                </select>
+                <button
+                  type="button"
+                  disabled={restoringProfile !== null}
+                  onClick={() => void handleRestoreProfile(profile.id)}
+                  className={cn(
+                    "rounded px-2 py-0.5 text-xs font-medium transition-colors",
+                    "text-blue-400 hover:bg-blue-500/15 hover:text-blue-300",
+                    restoringProfile === profile.id && "opacity-50",
+                  )}
+                >
+                  {restoringProfile === profile.id ? "Loading..." : "Restore"}
+                </button>
+                {renamingProfile !== profile.id && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRenamingProfile(profile.id);
+                      setRenameValue(profile.name);
+                    }}
+                    className="rounded px-2 py-0.5 text-xs text-zinc-400 transition-colors hover:bg-zinc-700/50 hover:text-zinc-200"
+                  >
+                    Rename
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void handleDeleteProfile(profile.id)}
+                  className="rounded px-2 py-0.5 text-xs text-zinc-500 transition-colors hover:bg-red-500/15 hover:text-red-400"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {profiles.length === 0 && (
+        <p className="text-xs text-zinc-600">
+          No saved profiles yet. Save your current window layout to get started.
+        </p>
+      )}
     </div>
   );
 }

@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager, State};
+
+mod session_watcher;
+mod window_group;
 
 #[cfg(desktop)]
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -11,6 +17,14 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 /// Used by the global shortcut handler to determine which event to emit.
 struct HotkeyState {
     bindings: Mutex<HashMap<String, String>>,
+}
+
+/// Managed state for the clipboard monitor background task.
+struct ClipboardMonitorState {
+    running: Arc<AtomicBool>,
+    /// When true, the next clipboard change is skipped (because we wrote it ourselves).
+    skip_next: Arc<AtomicBool>,
+    last_hash: Arc<Mutex<u64>>,
 }
 
 #[cfg(desktop)]
@@ -272,6 +286,107 @@ async fn resume_session(working_dir: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Hash a string for change detection.
+fn hash_string(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Start a background task that polls the system clipboard every 750ms.
+/// On each change, emits a `clipboard:new-entry` event to the frontend.
+#[tauri::command]
+async fn start_clipboard_monitor(
+    app: tauri::AppHandle,
+    state: State<'_, ClipboardMonitorState>,
+) -> Result<(), String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Ok(()); // already running
+    }
+    state.running.store(true, Ordering::SeqCst);
+
+    let running = Arc::clone(&state.running);
+    let skip_next = Arc::clone(&state.skip_next);
+    let last_hash = Arc::clone(&state.last_hash);
+
+    tokio::spawn(async move {
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Read clipboard text
+            let text = {
+                match arboard::Clipboard::new() {
+                    Ok(mut cb) => cb.get_text().ok(),
+                    Err(_) => None,
+                }
+            };
+
+            if let Some(content) = text {
+                if content.is_empty() || content.len() > 100_000 {
+                    continue;
+                }
+
+                let new_hash = hash_string(&content);
+                let mut hash_guard = last_hash.lock().unwrap();
+
+                if new_hash != *hash_guard {
+                    *hash_guard = new_hash;
+
+                    // Check if we should skip (we wrote this ourselves)
+                    if skip_next.swap(false, Ordering::SeqCst) {
+                        continue;
+                    }
+
+                    let _ = app.emit("clipboard:new-entry", serde_json::json!({
+                        "content": content,
+                        "contentType": "text",
+                    }));
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Stop the clipboard monitor background task.
+#[tauri::command]
+async fn stop_clipboard_monitor(
+    state: State<'_, ClipboardMonitorState>,
+) -> Result<(), String> {
+    state.running.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Write text to the system clipboard (for re-copying entries).
+/// Sets the skip_next flag so the monitor doesn't re-detect this write.
+#[tauri::command]
+async fn write_clipboard(
+    text: String,
+    state: State<'_, ClipboardMonitorState>,
+) -> Result<(), String> {
+    state.skip_next.store(true, Ordering::SeqCst);
+
+    // Update last_hash to match what we're writing
+    let new_hash = hash_string(&text);
+    {
+        let mut hash_guard = state.last_hash.lock().unwrap();
+        *hash_guard = new_hash;
+    }
+
+    let mut cb = arboard::Clipboard::new().map_err(|e| format!("Clipboard error: {e}"))?;
+    cb.set_text(&text).map_err(|e| format!("Failed to write clipboard: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let hotkey_state = HotkeyState {
@@ -287,7 +402,18 @@ pub fn run() {
         map.insert("Ctrl+Shift+D".to_string(), "hide-children".to_string());
         map.insert("Ctrl+,".to_string(), "opacity-decrease".to_string());
         map.insert("Ctrl+.".to_string(), "opacity-increase".to_string());
+        map.insert("Ctrl+Shift+V".to_string(), "toggle-clipboard".to_string());
+        map.insert("Ctrl+Shift+T".to_string(), "reopen-last-closed".to_string());
     }
+
+    let clipboard_state = ClipboardMonitorState {
+        running: Arc::new(AtomicBool::new(false)),
+        skip_next: Arc::new(AtomicBool::new(false)),
+        last_hash: Arc::new(Mutex::new(0)),
+    };
+
+    let window_group_state = window_group::WindowGroupState::default();
+    let session_watcher_state = session_watcher::SessionWatcherState::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -295,13 +421,27 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(hotkey_state)
+        .manage(clipboard_state)
+        .manage(window_group_state)
+        .manage(session_watcher_state)
         .invoke_handler(tauri::generate_handler![
             open_path,
             read_text_file,
             resume_session,
             read_file_head_tail,
             register_hotkey,
-            unregister_hotkey
+            unregister_hotkey,
+            start_clipboard_monitor,
+            stop_clipboard_monitor,
+            write_clipboard,
+            window_group::group_windows,
+            window_group::ungroup_window,
+            window_group::ungroup_all,
+            window_group::ungroup_group,
+            window_group::list_groups,
+            window_group::prevent_maximize,
+            session_watcher::start_session_watcher,
+            session_watcher::stop_session_watcher
         ])
         .setup(|app| {
             #[cfg(desktop)]
@@ -348,6 +488,13 @@ pub fn run() {
                     ("Ctrl+Shift+D", "hide-children"),
                     ("Ctrl+,", "opacity-decrease"),
                     ("Ctrl+.", "opacity-increase"),
+                    ("Ctrl+Shift+V", "toggle-clipboard"),
+                    ("Ctrl+Shift+T", "reopen-last-closed"),
+                    ("Ctrl+Shift+1", "workspace-1"),
+                    ("Ctrl+Shift+2", "workspace-2"),
+                    ("Ctrl+Shift+3", "workspace-3"),
+                    ("Ctrl+Shift+4", "workspace-4"),
+                    ("Ctrl+Shift+5", "workspace-5"),
                 ];
 
                 for (shortcut_str, _action) in &default_shortcuts {

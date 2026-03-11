@@ -6,10 +6,12 @@ import { WindowChrome } from "@/components/WindowChrome";
 import { SessionTimeline, AgentTabBar, deriveAgents } from "@/components/SessionTimeline";
 import { getLogFile, parseLogFile, renameLogFile, setLogFileOpen } from "@/lib/logFileService";
 import type { SessionEvent } from "@/lib/sessionService";
+import { useWindowGrouping } from "@/lib/useWindowGrouping";
 
 export function LogFileWindow() {
   const { id } = useParams<{ id: string }>();
   useWindowStateSaver(id, "log_files");
+  const { isGrouped, snapPreview, ungroup, ungroupAll } = useWindowGrouping();
 
   // Mark as open on mount (for window restore on next launch)
   useEffect(() => {
@@ -91,6 +93,10 @@ export function LogFileWindow() {
       title={title}
       onBeforeClose={handleBeforeClose}
       onRename={(name) => void handleRename(name)}
+      isGrouped={isGrouped}
+      onUngroup={isGrouped ? () => void ungroup() : undefined}
+      onUngroupAll={isGrouped ? () => void ungroupAll() : undefined}
+      snapPreview={snapPreview}
     >
       {/* Controls bar */}
       <div

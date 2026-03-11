@@ -13,6 +13,10 @@ import {
   listSessions,
   type SessionMeta,
 } from "@/lib/sessionService";
+import {
+  listClipboardEntries,
+  type ClipboardEntry,
+} from "@/lib/clipboardService";
 
 // Re-export session types from sessionService for convenience
 export type { SessionMeta };
@@ -38,10 +42,14 @@ export interface GlobalState {
   refreshSessions: () => Promise<void>;
   /** Fast DB-only load for instant display on startup. */
   hydrateSessions: () => Promise<void>;
+  /** Synchronously patch a session label in the store. No async, no races. */
+  updateSessionLabel: (sessionId: string, label: string | null) => void;
   /** Called by session windows to push their live status to the control panel. */
   setSessionStatus: (sessionId: string, status: SessionMeta["status"]) => void;
   /** Called when a session window closes — removes the override. */
   clearSessionStatus: (sessionId: string) => void;
+  /** Merge a single updated session into the store (for targeted file-change updates). */
+  upsertSessionInStore: (session: SessionMeta) => void;
 
   // --- Columns slice ---
   columns: KanbanColumn[];
@@ -77,6 +85,11 @@ export interface GlobalState {
   /** Incremented each time the hide-children hotkey fires. ControlPanel watches this. */
   hideChildrenToggleCount: number;
   toggleHideChildren: () => void;
+
+  // --- Clipboard slice ---
+  clipboardEntries: ClipboardEntry[];
+  clipboardLoading: boolean;
+  refreshClipboard: () => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +167,13 @@ export const useGlobalStore = create<GlobalState>()(
           console.error("[globalStore] hydrateSessions failed:", err);
         }
       },
+      updateSessionLabel: (sessionId, label) => {
+        set((state) => ({
+          sessions: state.sessions.map((s) =>
+            s.sessionId === sessionId ? { ...s, label } : s,
+          ),
+        }));
+      },
       refreshSessions: async () => {
         try {
           const sessions = await discoverSessions();
@@ -183,6 +203,25 @@ export const useGlobalStore = create<GlobalState>()(
         set((state) => {
           const { [sessionId]: _, ...rest } = state.sessionStatusOverrides;
           return { sessionStatusOverrides: rest };
+        });
+      },
+      upsertSessionInStore: (session) => {
+        set((state) => {
+          // Apply status override if one exists
+          const override = state.sessionStatusOverrides[session.sessionId];
+          const merged = override ? { ...session, status: override } : session;
+
+          const idx = state.sessions.findIndex((s) => s.sessionId === merged.sessionId);
+          if (idx >= 0) {
+            const updated = [...state.sessions];
+            updated[idx] = merged;
+            return { sessions: updated };
+          }
+          // New session — insert at the right sorted position (newest first)
+          const sessions = [...state.sessions, merged].sort(
+            (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
+          );
+          return { sessions };
         });
       },
 
@@ -277,10 +316,23 @@ export const useGlobalStore = create<GlobalState>()(
           hideChildrenToggleCount: state.hideChildrenToggleCount + 1,
         }));
       },
+
+      // --- Clipboard ---
+      clipboardEntries: [],
+      clipboardLoading: false,
+      refreshClipboard: async () => {
+        try {
+          const entries = await listClipboardEntries();
+          set({ clipboardEntries: entries, clipboardLoading: false });
+        } catch (err) {
+          console.error("[globalStore] refreshClipboard failed:", err);
+          set({ clipboardLoading: false });
+        }
+      },
     }),
     {
       // Only broadcast data arrays — NOT loading flags or functions
-      syncKeys: ["notes", "sessionStatusOverrides", "columns", "tickets", "opacity", "isHidden", "preHideOpacity", "childrenHidden"],
+      syncKeys: ["notes", "sessionStatusOverrides", "columns", "tickets", "opacity", "isHidden", "preHideOpacity", "childrenHidden", "clipboardEntries"],
     },
   ),
 );

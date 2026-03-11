@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { getDatabase } from "./database";
+import { getMonitors, monitorAt, computeSnap } from "./monitorUtils";
+import type { MonitorInfo } from "./monitorUtils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -11,6 +14,11 @@ export interface WindowState {
   y: number;
   width: number;
   height: number;
+  /** Name of the monitor the window was last on, for multi-monitor restore. */
+  monitorName?: string | null;
+  /** Scale factor of the monitor the window was last on. Used to adjust size
+   *  when restoring on a monitor with a different DPI. */
+  scaleFactor?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -30,11 +38,25 @@ export async function saveWindowState(
   const pos = await appWindow.outerPosition();
   const size = await appWindow.innerSize();
 
+  // Determine which monitor this window is currently on
+  let monitorName: string | null = null;
+  let scaleFactor: number | undefined;
+  try {
+    const monitors = await getMonitors();
+    const mon = monitorAt(monitors, pos.x, pos.y);
+    monitorName = mon?.name ?? null;
+    scaleFactor = mon?.scaleFactor;
+  } catch {
+    // best effort
+  }
+
   const state: WindowState = {
     x: pos.x,
     y: pos.y,
     width: size.width,
     height: size.height,
+    monitorName,
+    scaleFactor,
   };
 
   const db = await getDatabase();
@@ -70,10 +92,12 @@ export async function loadWindowState(
 // ---------------------------------------------------------------------------
 
 const SAVE_DEBOUNCE_MS = 2000;
+const SNAP_DEBOUNCE_MS = 150;
 
 /**
  * Hook that listens for window move/resize events and persists the
  * window's position and size to SQLite, debounced at 2 seconds.
+ * Also handles snap-to-edge when the window is dragged near a monitor edge.
  *
  * Usage:
  * ```ts
@@ -85,10 +109,19 @@ export function useWindowStateSaver(
   table: "notes" | "sessions" | "log_files" | "session_groups",
 ): void {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const snapDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const monitorsRef = useRef<MonitorInfo[] | null>(null);
+  // Prevent snap from re-triggering itself
+  const isSnappingRef = useRef(false);
 
   useEffect(() => {
     if (!id) return;
     const appWindow = getCurrentWebviewWindow();
+
+    // Cache monitors on mount
+    getMonitors()
+      .then((m) => { monitorsRef.current = m; })
+      .catch(console.error);
 
     const handleChange = () => {
       clearTimeout(debounceRef.current);
@@ -97,12 +130,43 @@ export function useWindowStateSaver(
       }, SAVE_DEBOUNCE_MS);
     };
 
+    const handleMove = () => {
+      handleChange();
+
+      // Snap-to-edge: debounce so it only fires after the user stops dragging
+      if (isSnappingRef.current) return;
+      clearTimeout(snapDebounceRef.current);
+      snapDebounceRef.current = setTimeout(async () => {
+        if (!monitorsRef.current) return;
+        try {
+          const pos = await appWindow.outerPosition();
+          const size = await appWindow.outerSize();
+          const snap = computeSnap(
+            monitorsRef.current,
+            pos.x,
+            pos.y,
+            size.width,
+            size.height,
+          );
+          if (snap) {
+            isSnappingRef.current = true;
+            await appWindow.setPosition(new PhysicalPosition(snap.x, snap.y));
+            // Small delay to let the onMoved event from snap pass through
+            setTimeout(() => { isSnappingRef.current = false; }, 100);
+          }
+        } catch {
+          // window may have been destroyed
+        }
+      }, SNAP_DEBOUNCE_MS);
+    };
+
     // Listen for move and resize events
-    const unlistenMove = appWindow.onMoved(handleChange);
+    const unlistenMove = appWindow.onMoved(handleMove);
     const unlistenResize = appWindow.onResized(handleChange);
 
     return () => {
       clearTimeout(debounceRef.current);
+      clearTimeout(snapDebounceRef.current);
       // Force an immediate save on unmount (window closing) so state isn't lost
       saveWindowState(id, table).catch(console.error);
       unlistenMove.then((fn) => fn()).catch(console.error);
