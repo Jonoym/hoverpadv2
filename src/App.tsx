@@ -244,11 +244,15 @@ function useCustomHotkeys() {
  */
 function useOpacityEffect() {
   const opacity = useGlobalStore((s) => s.opacity);
+  const prevOpacityRef = useRef(opacity);
 
   useEffect(() => {
     const win = getCurrentWebviewWindow();
     // Notification window manages its own opacity — skip it
     if (win.label === "notifications") return;
+
+    const wasHidden = prevOpacityRef.current < 0.2;
+    prevOpacityRef.current = opacity;
 
     // When global opacity becomes visible, clear per-window minimized state
     // so Ctrl+H unhide restores all minimized windows
@@ -265,6 +269,11 @@ function useOpacityEffect() {
     // Click-through when hidden (opacity 0) or at the minimum threshold
     const isClickThrough = opacity < 0.2;
     win.setIgnoreCursorEvents(isClickThrough).catch(console.error);
+
+    // When unhiding, focus the window so it's immediately interactive
+    if (wasHidden && opacity >= 0.2) {
+      win.setFocus().catch(console.error);
+    }
   }, [opacity]);
 }
 

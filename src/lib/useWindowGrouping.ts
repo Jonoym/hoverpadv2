@@ -21,6 +21,9 @@ const SNAP_GAP = 4;
 /** Distance beyond which a grouped window auto-ungroups. */
 const UNGROUP_DISTANCE = 150;
 
+/** Re-entrancy guard: true while we are programmatically moving grouped siblings. */
+let isMovingSiblings = false;
+
 
 // ---------------------------------------------------------------------------
 // Hook
@@ -90,11 +93,13 @@ export function useWindowGrouping() {
     };
   }, []);
 
-  // Detect platform — on non-Windows, we use a timer-based drag-end fallback
+  // Detect platform — on non-Windows, we handle group drag + drag-end in frontend
   const isMacOrLinux = useRef(
     !navigator.platform.toUpperCase().includes("WIN"),
   );
   const dragEndTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** Last known position of this window, used to compute drag delta for group moves. */
+  const lastPosRef = useRef<{ x: number; y: number } | null>(null);
 
   // Main drag-snap effect
   useEffect(() => {
@@ -301,7 +306,62 @@ export function useWindowGrouping() {
       setSnapPreview(false);
     };
 
+    /**
+     * Move grouped siblings on non-Windows when this window is dragged.
+     * On Windows this is handled natively via WM_MOVING in the Rust subclass.
+     */
+    const moveGroupSiblings = async () => {
+      if (!isMacOrLinux.current || isMovingSiblings) return;
+
+      try {
+        const myLabel = appWindow.label;
+        const pos = await appWindow.outerPosition();
+
+        const prev = lastPosRef.current;
+        lastPosRef.current = { x: pos.x, y: pos.y };
+
+        if (!prev) return;
+        const dx = pos.x - prev.x;
+        const dy = pos.y - prev.y;
+        if (dx === 0 && dy === 0) return;
+
+        const groups = await listGroups();
+        const myGroup = groups.find((g) => g.labels.includes(myLabel));
+        if (!myGroup || myGroup.labels.length < 2) return;
+
+        const allWindows = await WebviewWindow.getAll();
+        const siblings = allWindows.filter(
+          (w) => w.label !== myLabel && myGroup.labels.includes(w.label),
+        );
+        if (siblings.length === 0) return;
+
+        isMovingSiblings = true;
+        try {
+          await Promise.all(
+            siblings.map(async (sib) => {
+              try {
+                const sibPos = await sib.outerPosition();
+                await sib.setPosition(
+                  new PhysicalPosition(sibPos.x + dx, sibPos.y + dy),
+                );
+              } catch { /* window may have closed */ }
+            }),
+          );
+        } finally {
+          isMovingSiblings = false;
+        }
+      } catch {
+        isMovingSiblings = false;
+      }
+    };
+
     const handleMove = () => {
+      // Skip moves caused by our own group-drag code
+      if (isMovingSiblings) return;
+
+      // Move grouped siblings immediately (non-Windows only)
+      void moveGroupSiblings();
+
       // Debounced proximity check (preview only, never commits)
       clearTimeout(moveTimerRef.current);
       moveTimerRef.current = setTimeout(() => void checkProximity(), 80);

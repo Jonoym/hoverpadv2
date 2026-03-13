@@ -8,8 +8,8 @@ import { getMonitors, monitorByName, monitorAt } from "./monitorUtils";
 import { getClipboardWindowState } from "./settingsService";
 
 /** Default logical size for new windows (no saved state). */
-const DEFAULT_WIDTH = 600;
-const DEFAULT_HEIGHT = 800;
+const DEFAULT_WIDTH = 380;
+const DEFAULT_HEIGHT = 500;
 
 /**
  * Resolves the base URL for new windows.
@@ -184,8 +184,8 @@ export async function createNoteWindow(noteId: string): Promise<void> {
   await createWindow({
     label,
     url,
-    minWidth: 300,
-    minHeight: 250,
+    minWidth: 250,
+    minHeight: 200,
     windowType: "note",
     savedState,
   });
@@ -220,10 +220,10 @@ export async function createSessionGroupWindow(projectDir: string): Promise<void
   await createWindow({
     label,
     url,
-    width: 300,
-    height: 500,
-    minWidth: 250,
-    minHeight: 200,
+    width: 260,
+    height: 400,
+    minWidth: 220,
+    minHeight: 180,
     windowType: "session-group",
     savedState,
   });
@@ -242,10 +242,10 @@ export async function createCustomGroupWindow(groupId: string): Promise<void> {
   await createWindow({
     label,
     url,
-    width: 300,
-    height: 500,
-    minWidth: 250,
-    minHeight: 200,
+    width: 260,
+    height: 400,
+    minWidth: 220,
+    minHeight: 180,
     windowType: "session-group",
     savedState,
   });
@@ -268,8 +268,8 @@ export async function createLogFileWindow(logFileId: string): Promise<void> {
   await createWindow({
     label,
     url,
-    minWidth: 350,
-    minHeight: 300,
+    minWidth: 280,
+    minHeight: 250,
     windowType: "logfile",
     savedState,
   });
@@ -286,8 +286,8 @@ export async function createSessionWindow(sessionId: string): Promise<void> {
   await createWindow({
     label,
     url,
-    minWidth: 350,
-    minHeight: 300,
+    minWidth: 280,
+    minHeight: 250,
     windowType: "session",
     savedState,
   });
@@ -310,17 +310,17 @@ export async function createClipboardWindow(): Promise<void> {
   await createWindow({
     label,
     url,
-    width: 400,
-    height: 600,
-    minWidth: 300,
-    minHeight: 400,
+    width: 300,
+    height: 420,
+    minWidth: 250,
+    minHeight: 300,
     windowType: "clipboard",
     savedState,
   });
 }
 
-const NOTIF_WIDTH = 340;
-const NOTIF_HEIGHT = 200;
+const NOTIF_WIDTH = 280;
+const NOTIF_HEIGHT = 160;
 
 /**
  * Create (or focus) the singleton notification overlay window.

@@ -176,11 +176,11 @@ export function WindowChrome({
       <div
         className={cn(
           "flex flex-1 flex-col",
-          "rounded-2xl border bg-neutral-900/90 transition-colors duration-200",
+          "rounded-2xl border bg-neutral-900 transition-colors duration-200",
           snapPreview
             ? "border-blue-500/70 shadow-[0_0_12px_rgba(59,130,246,0.3)]"
             : flashColor ?? "border-neutral-700/50",
-          "shadow-2xl backdrop-blur-md",
+          "shadow-2xl",
           "overflow-hidden",
         )}
       >

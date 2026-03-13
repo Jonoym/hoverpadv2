@@ -119,6 +119,11 @@
 }
 
 /* Required for Tauri transparent window */
+html {
+  /* Scale all rem-based UI down for a compact overlay feel */
+  font-size: 13px;
+}
+
 html,
 body {
   background: transparent;
