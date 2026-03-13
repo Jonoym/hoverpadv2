@@ -591,11 +591,11 @@ export function SessionWindow() {
           "px-2 py-1",
         )}
       >
-        {/* Focus in VS Code */}
+        {/* Open in VS Code */}
         {sessionMeta?.workingDir && (
           <button
             type="button"
-            onClick={() => invoke("resume_session", { workingDir: sessionMeta.workingDir }).catch(console.error)}
+            onClick={() => invoke("open_vscode", { workingDir: sessionMeta.workingDir }).catch(console.error)}
             className={cn(
               "flex h-6 items-center gap-1.5 rounded-md px-2 transition-colors duration-150",
               "bg-blue-500/15 text-blue-400 hover:bg-blue-500/25",
@@ -607,7 +607,26 @@ export function SessionWindow() {
               <path d="M10 2h4v4" />
               <path d="M14 2L7 9" />
             </svg>
-            <span className="text-xs font-medium">Open</span>
+            <span className="text-xs font-medium">Code</span>
+          </button>
+        )}
+
+        {/* Open terminal */}
+        {sessionMeta?.workingDir && (
+          <button
+            type="button"
+            onClick={() => invoke("open_terminal", { workingDir: sessionMeta.workingDir }).catch(console.error)}
+            className={cn(
+              "flex h-6 items-center gap-1.5 rounded-md px-2 transition-colors duration-150",
+              "bg-green-500/15 text-green-400 hover:bg-green-500/25",
+            )}
+            title="Open terminal"
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+              <path d="M2 4l5 4-5 4" />
+              <path d="M9 12h5" />
+            </svg>
+            <span className="text-xs font-medium">Terminal</span>
           </button>
         )}
 

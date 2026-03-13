@@ -122,6 +122,9 @@
 html,
 body {
   background: transparent;
+  /* Prevent macOS elastic overscroll bounce on the window itself */
+  overscroll-behavior: none;
+  overflow: hidden;
 }
 
 /* Dark-themed scrollbars for all scrollable elements */

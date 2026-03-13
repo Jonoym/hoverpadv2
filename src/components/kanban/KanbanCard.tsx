@@ -23,6 +23,7 @@ interface KanbanCardProps {
   onUpdateDescription: (ticketId: string, description: string) => void;
   onOpenSession: (sessionId: string) => void;
   onFocusSession: (session: SessionMeta) => void;
+  onOpenTerminalSession: (session: SessionMeta) => void;
   onCopyResumeSession: (session: SessionMeta) => void;
   onDeleteSession: (session: SessionMeta) => void;
   onLinkSession: (ticketId: string, sessionId: string) => void;
@@ -145,6 +146,7 @@ export function KanbanCard({
   onUpdateDescription,
   onOpenSession,
   onFocusSession,
+  onOpenTerminalSession,
   onCopyResumeSession,
   onDeleteSession,
   onLinkSession,
@@ -498,6 +500,20 @@ export function KanbanCard({
                       <svg width="11" height="11" viewBox="0 0 16 16" fill="none" className="shrink-0">
                         <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
                         <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" stroke="currentColor" strokeWidth="1.3" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenTerminalSession(session);
+                      }}
+                      className="flex h-5 w-5 cursor-pointer items-center justify-center rounded text-neutral-600 transition-colors duration-150 hover:text-green-400"
+                      title="Open terminal"
+                    >
+                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                        <path d="M2 4l5 4-5 4" />
+                        <path d="M9 12h5" />
                       </svg>
                     </button>
                     <button

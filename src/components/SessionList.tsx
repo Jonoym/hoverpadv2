@@ -143,6 +143,7 @@ interface SessionRowProps {
   onFinishRename: () => void;
   onCancelRename: () => void;
   onFocus: (session: SessionMeta) => void;
+  onOpenTerminal: (session: SessionMeta) => void;
   onWatch: (session: SessionMeta) => void;
   onCopyResume: (session: SessionMeta) => void;
   onDragStart?: (sessionId: string, e: React.PointerEvent) => void;
@@ -161,6 +162,7 @@ function SessionRow({
   onFinishRename,
   onCancelRename,
   onFocus,
+  onOpenTerminal,
   onWatch,
   onCopyResume,
   onDragStart,
@@ -253,6 +255,17 @@ function SessionRow({
             <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
               <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
               <path d="M10.5 5.5V3.5C10.5 2.67 9.83 2 9 2H3.5C2.67 2 2 2.67 2 3.5V9C2 9.83 2.67 10.5 3.5 10.5H5.5" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onOpenTerminal(session); }}
+            className="shrink-0 flex h-5 w-5 items-center justify-center rounded text-neutral-500 transition-colors duration-150 hover:text-green-400 cursor-pointer"
+            title="Open terminal"
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+              <path d="M2 4l5 4-5 4" />
+              <path d="M9 12h5" />
             </svg>
           </button>
           <button
@@ -552,11 +565,21 @@ export function SessionList({ sessions, onRefresh }: SessionListProps) {
 
   const handleFocus = async (session: SessionMeta) => {
     try {
-      await invoke("resume_session", {
+      await invoke("open_vscode", {
         workingDir: session.workingDir || session.projectDir,
       });
     } catch (err) {
-      console.error("[hoverpad] Failed to focus VSCode:", err);
+      console.error("[hoverpad] Failed to open VSCode:", err);
+    }
+  };
+
+  const handleOpenTerminal = async (session: SessionMeta) => {
+    try {
+      await invoke("open_terminal", {
+        workingDir: session.workingDir || session.projectDir,
+      });
+    } catch (err) {
+      console.error("[hoverpad] Failed to open terminal:", err);
     }
   };
 
@@ -889,6 +912,7 @@ export function SessionList({ sessions, onRefresh }: SessionListProps) {
     onFinishRename: () => void handleFinishRename(),
     onCancelRename: () => setRenamingId(null),
     onFocus: (s: SessionMeta) => void handleFocus(s),
+    onOpenTerminal: (s: SessionMeta) => void handleOpenTerminal(s),
     onWatch: (s: SessionMeta) => void handleWatch(s),
     onCopyResume: handleCopyResume,
     onContextMenu: (s: SessionMeta, x: number, y: number) => handleSessionContextMenu(s, x, y),

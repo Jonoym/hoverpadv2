@@ -59,10 +59,11 @@
   overflow-y: auto;
 }
 
-/* Fill the editor to the bottom of the window.
-   Titlebar ~2.25rem + toolbar ~2.25rem + padding ~0.5rem ≈ 5rem */
+/* Allow editor content to fill available flex space without forcing a min-height.
+   The flex layout (flex: 1 on parent) already stretches the editor; a large min-height
+   causes empty code blocks to expand to viewport height. */
 .dark-theme [role="textbox"] {
-  min-height: calc(100vh - 6.5rem);
+  min-height: 0;
   cursor: text;
 }
 

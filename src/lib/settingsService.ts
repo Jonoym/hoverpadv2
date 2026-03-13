@@ -2,23 +2,27 @@ import { getDatabase } from "./database";
 
 export interface HotkeyBinding {
   action: string;
-  shortcut: string; // e.g. "Ctrl+N"
+  shortcut: string; // e.g. "Ctrl+N" or "Super+N" on macOS
 }
 
+/** On macOS, default hotkeys use Cmd (Super) instead of Ctrl. */
+const isMac = navigator.platform.toUpperCase().includes("MAC");
+const MOD = isMac ? "Super" : "Ctrl";
+
 const DEFAULT_HOTKEYS: Record<string, string> = {
-  "new-note": "Ctrl+N",
-  "toggle-visibility": "Ctrl+H",
-  "toggle-collapse": "Ctrl+J",
-  "hide-children": "Ctrl+Shift+D",
-  "opacity-decrease": "Ctrl+,",
-  "opacity-increase": "Ctrl+.",
-  "toggle-clipboard": "Ctrl+Shift+V",
-  "reopen-last-closed": "Ctrl+Shift+T",
-  "workspace-1": "Ctrl+Shift+1",
-  "workspace-2": "Ctrl+Shift+2",
-  "workspace-3": "Ctrl+Shift+3",
-  "workspace-4": "Ctrl+Shift+4",
-  "workspace-5": "Ctrl+Shift+5",
+  "new-note": `${MOD}+N`,
+  "toggle-visibility": `${MOD}+H`,
+  "toggle-collapse": `${MOD}+J`,
+  "hide-children": `${MOD}+Shift+D`,
+  "opacity-decrease": `${MOD}+,`,
+  "opacity-increase": `${MOD}+.`,
+  "toggle-clipboard": `${MOD}+Shift+V`,
+  "reopen-last-closed": `${MOD}+Shift+T`,
+  "workspace-1": `${MOD}+Shift+1`,
+  "workspace-2": `${MOD}+Shift+2`,
+  "workspace-3": `${MOD}+Shift+3`,
+  "workspace-4": `${MOD}+Shift+4`,
+  "workspace-5": `${MOD}+Shift+5`,
 };
 
 export async function getSetting(key: string): Promise<string | null> {

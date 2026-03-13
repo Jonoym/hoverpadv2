@@ -348,10 +348,21 @@ export function KanbanBoard() {
 
   const handleFocusSession = useCallback(
     (session: SessionMeta) => {
-      void invoke("resume_session", {
+      void invoke("open_vscode", {
         workingDir: session.workingDir || session.projectDir,
       }).catch((err) => {
-        console.error("[hoverpad] Failed to focus editor from kanban:", err);
+        console.error("[hoverpad] Failed to open VS Code from kanban:", err);
+      });
+    },
+    [],
+  );
+
+  const handleOpenTerminalSession = useCallback(
+    (session: SessionMeta) => {
+      void invoke("open_terminal", {
+        workingDir: session.workingDir || session.projectDir,
+      }).catch((err) => {
+        console.error("[hoverpad] Failed to open terminal from kanban:", err);
       });
     },
     [],
@@ -561,6 +572,7 @@ export function KanbanBoard() {
               onUpdateDescription={handleUpdateDescription}
               onOpenSession={handleOpenSession}
               onFocusSession={handleFocusSession}
+              onOpenTerminalSession={handleOpenTerminalSession}
               onCopyResumeSession={handleCopyResumeSession}
               onDeleteSession={handleDeleteSession}
               onLinkSession={handleLinkSession}

@@ -25,6 +25,7 @@ interface KanbanColumnProps {
   onUpdateDescription: (ticketId: string, description: string) => void;
   onOpenSession: (sessionId: string) => void;
   onFocusSession: (session: SessionMeta) => void;
+  onOpenTerminalSession: (session: SessionMeta) => void;
   onCopyResumeSession: (session: SessionMeta) => void;
   onDeleteSession: (session: SessionMeta) => void;
   onLinkSession: (ticketId: string, sessionId: string) => void;
@@ -59,6 +60,7 @@ export function KanbanColumn({
   onUpdateDescription,
   onOpenSession,
   onFocusSession,
+  onOpenTerminalSession,
   onCopyResumeSession,
   onDeleteSession,
   onLinkSession,
@@ -139,6 +141,7 @@ export function KanbanColumn({
             onUpdateDescription={onUpdateDescription}
             onOpenSession={onOpenSession}
             onFocusSession={onFocusSession}
+            onOpenTerminalSession={onOpenTerminalSession}
             onCopyResumeSession={onCopyResumeSession}
             onDeleteSession={onDeleteSession}
             onLinkSession={onLinkSession}

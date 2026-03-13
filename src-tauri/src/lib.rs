@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager, State};
 
+#[cfg(target_os = "macos")]
+use tauri::menu::{MenuBuilder, SubmenuBuilder};
+
 mod session_watcher;
 mod window_group;
 
@@ -273,16 +276,83 @@ async fn open_path(path: String) -> Result<(), String> {
 }
 
 /// Open VSCode at the given directory.
+/// On macOS, GUI apps don't inherit the shell PATH, so `code` may not be found.
+/// We use `open -a` as a reliable fallback.
 #[tauri::command]
-async fn resume_session(working_dir: String) -> Result<(), String> {
+async fn open_vscode(working_dir: String) -> Result<(), String> {
     let path = std::path::Path::new(&working_dir);
     if !path.exists() || !path.is_dir() {
         return Err(format!("Directory does not exist: {working_dir}"));
     }
-    std::process::Command::new("code")
-        .arg(&working_dir)
-        .spawn()
-        .map_err(|e| format!("Failed to open VSCode: {e}"))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let result = std::process::Command::new("code")
+            .arg(&working_dir)
+            .spawn();
+        if result.is_err() {
+            std::process::Command::new("open")
+                .args(["-a", "Visual Studio Code", &working_dir])
+                .spawn()
+                .map_err(|e| format!("Failed to open VSCode: {e}"))?;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::process::Command::new("code")
+            .arg(&working_dir)
+            .spawn()
+            .map_err(|e| format!("Failed to open VSCode: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Open a terminal at the given directory.
+#[tauri::command]
+async fn open_terminal(working_dir: String) -> Result<(), String> {
+    let path = std::path::Path::new(&working_dir);
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("Directory does not exist: {working_dir}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "wt", "-d", &working_dir])
+            .spawn()
+            .or_else(|_| {
+                // Fallback to cmd if Windows Terminal is not installed
+                std::process::Command::new("cmd")
+                    .args(["/c", "start", "cmd", "/k", &format!("cd /d {}", working_dir)])
+                    .spawn()
+            })
+            .map_err(|e| format!("Failed to open terminal: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-a", "Terminal", &working_dir])
+            .spawn()
+            .map_err(|e| format!("Failed to open terminal: {e}"))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try common terminal emulators
+        let result = std::process::Command::new("x-terminal-emulator")
+            .current_dir(&working_dir)
+            .spawn();
+        if result.is_err() {
+            std::process::Command::new("xterm")
+                .current_dir(&working_dir)
+                .spawn()
+                .map_err(|e| format!("Failed to open terminal: {e}"))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -393,17 +463,22 @@ pub fn run() {
         bindings: Mutex::new(HashMap::new()),
     };
 
-    // Populate with defaults
+    // Populate with defaults — use Cmd (Super) on macOS, Ctrl elsewhere
+    #[cfg(target_os = "macos")]
+    let mod_key = "Super";
+    #[cfg(not(target_os = "macos"))]
+    let mod_key = "Ctrl";
+
     {
         let mut map = hotkey_state.bindings.lock().unwrap();
-        map.insert("Ctrl+N".to_string(), "new-note".to_string());
-        map.insert("Ctrl+H".to_string(), "toggle-visibility".to_string());
-        map.insert("Ctrl+J".to_string(), "toggle-collapse".to_string());
-        map.insert("Ctrl+Shift+D".to_string(), "hide-children".to_string());
-        map.insert("Ctrl+,".to_string(), "opacity-decrease".to_string());
-        map.insert("Ctrl+.".to_string(), "opacity-increase".to_string());
-        map.insert("Ctrl+Shift+V".to_string(), "toggle-clipboard".to_string());
-        map.insert("Ctrl+Shift+T".to_string(), "reopen-last-closed".to_string());
+        map.insert(format!("{mod_key}+N"), "new-note".to_string());
+        map.insert(format!("{mod_key}+H"), "toggle-visibility".to_string());
+        map.insert(format!("{mod_key}+J"), "toggle-collapse".to_string());
+        map.insert(format!("{mod_key}+Shift+D"), "hide-children".to_string());
+        map.insert(format!("{mod_key}+,"), "opacity-decrease".to_string());
+        map.insert(format!("{mod_key}+."), "opacity-increase".to_string());
+        map.insert(format!("{mod_key}+Shift+V"), "toggle-clipboard".to_string());
+        map.insert(format!("{mod_key}+Shift+T"), "reopen-last-closed".to_string());
     }
 
     let clipboard_state = ClipboardMonitorState {
@@ -427,7 +502,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_path,
             read_text_file,
-            resume_session,
+            open_vscode,
+            open_terminal,
             read_file_head_tail,
             register_hotkey,
             unregister_hotkey,
@@ -481,29 +557,48 @@ pub fn run() {
 
                 // Register each default shortcut individually, logging warnings on failure
                 let gs = app_handle.global_shortcut();
+
+                #[cfg(target_os = "macos")]
+                let (mk, smk) = ("Super", "Super+Shift");
+                #[cfg(not(target_os = "macos"))]
+                let (mk, smk) = ("Ctrl", "Ctrl+Shift");
+
                 let default_shortcuts = [
-                    ("Ctrl+N", "new-note"),
-                    ("Ctrl+H", "toggle-visibility"),
-                    ("Ctrl+J", "toggle-collapse"),
-                    ("Ctrl+Shift+D", "hide-children"),
-                    ("Ctrl+,", "opacity-decrease"),
-                    ("Ctrl+.", "opacity-increase"),
-                    ("Ctrl+Shift+V", "toggle-clipboard"),
-                    ("Ctrl+Shift+T", "reopen-last-closed"),
-                    ("Ctrl+Shift+1", "workspace-1"),
-                    ("Ctrl+Shift+2", "workspace-2"),
-                    ("Ctrl+Shift+3", "workspace-3"),
-                    ("Ctrl+Shift+4", "workspace-4"),
-                    ("Ctrl+Shift+5", "workspace-5"),
+                    (format!("{mk}+N"), "new-note"),
+                    (format!("{mk}+H"), "toggle-visibility"),
+                    (format!("{mk}+J"), "toggle-collapse"),
+                    (format!("{smk}+D"), "hide-children"),
+                    (format!("{mk}+,"), "opacity-decrease"),
+                    (format!("{mk}+."), "opacity-increase"),
+                    (format!("{smk}+V"), "toggle-clipboard"),
+                    (format!("{smk}+T"), "reopen-last-closed"),
+                    (format!("{smk}+1"), "workspace-1"),
+                    (format!("{smk}+2"), "workspace-2"),
+                    (format!("{smk}+3"), "workspace-3"),
+                    (format!("{smk}+4"), "workspace-4"),
+                    (format!("{smk}+5"), "workspace-5"),
                 ];
 
                 for (shortcut_str, _action) in &default_shortcuts {
-                    if let Ok(shortcut) = parse_shortcut(shortcut_str) {
+                    if let Ok(shortcut) = parse_shortcut(shortcut_str.as_str()) {
                         if let Err(e) = gs.register(shortcut) {
                             eprintln!("[hoverpad] failed to register {}: {e}", shortcut_str);
                         }
                     }
                 }
+            }
+
+            // On macOS, replace the default menu to remove Cmd+H "Hide" accelerator
+            // so our global shortcut can capture it instead.
+            #[cfg(target_os = "macos")]
+            {
+                let app_menu = SubmenuBuilder::new(app, "Hoverpad")
+                    .about(None)
+                    .separator()
+                    .quit()
+                    .build()?;
+                let menu = MenuBuilder::new(app).item(&app_menu).build()?;
+                app.set_menu(menu)?;
             }
 
             // When the main window is closed, close all other windows and exit

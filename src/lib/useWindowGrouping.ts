@@ -90,6 +90,12 @@ export function useWindowGrouping() {
     };
   }, []);
 
+  // Detect platform — on non-Windows, we use a timer-based drag-end fallback
+  const isMacOrLinux = useRef(
+    !navigator.platform.toUpperCase().includes("WIN"),
+  );
+  const dragEndTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
   // Main drag-snap effect
   useEffect(() => {
     const appWindow = getCurrentWebviewWindow();
@@ -299,9 +305,15 @@ export function useWindowGrouping() {
       // Debounced proximity check (preview only, never commits)
       clearTimeout(moveTimerRef.current);
       moveTimerRef.current = setTimeout(() => void checkProximity(), 80);
+
+      // On macOS/Linux, detect drag-end via movement settling (no WM_EXITSIZEMOVE)
+      if (isMacOrLinux.current) {
+        clearTimeout(dragEndTimerRef.current);
+        dragEndTimerRef.current = setTimeout(() => void commitSnap(), 200);
+      }
     };
 
-    // Listen for the native drag-end event (WM_EXITSIZEMOVE) from Rust
+    // Listen for the native drag-end event (WM_EXITSIZEMOVE) from Rust (Windows only)
     const unlistenDragEnd = listen("window:drag-end", () => {
       void commitSnap();
     });
@@ -310,6 +322,7 @@ export function useWindowGrouping() {
 
     return () => {
       clearTimeout(moveTimerRef.current);
+      clearTimeout(dragEndTimerRef.current);
       if (previewTargetRef.current) {
         emitEvent("window:snap-preview", { label: previewTargetRef.current, active: false }).catch(() => {});
         previewTargetRef.current = null;

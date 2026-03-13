@@ -400,9 +400,18 @@ export function SessionGroupWindow() {
   const handleOpenVSCode = async (session: SessionMeta) => {
     if (!session.workingDir) return;
     try {
-      await invoke("resume_session", { workingDir: session.workingDir });
+      await invoke("open_vscode", { workingDir: session.workingDir });
     } catch (err) {
       console.error("[hoverpad] Failed to open VS Code:", err);
+    }
+  };
+
+  const handleOpenTerminal = async (session: SessionMeta) => {
+    if (!session.workingDir) return;
+    try {
+      await invoke("open_terminal", { workingDir: session.workingDir });
+    } catch (err) {
+      console.error("[hoverpad] Failed to open terminal:", err);
     }
   };
 
@@ -620,6 +629,19 @@ export function SessionGroupWindow() {
                       </svg>
                     )}
                   </button>
+                  {session.workingDir && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); void handleOpenTerminal(session); }}
+                      className="shrink-0 flex h-5 w-5 items-center justify-center rounded text-neutral-500 transition-colors duration-150 hover:text-green-400 cursor-pointer"
+                      title="Open terminal"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                        <path d="M2 4l5 4-5 4" />
+                        <path d="M9 12h5" />
+                      </svg>
+                    </button>
+                  )}
                   {session.workingDir && (
                     <button
                       type="button"

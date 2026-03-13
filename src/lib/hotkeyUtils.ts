@@ -2,8 +2,12 @@ export function keyEventToShortcutString(e: KeyboardEvent): string | null {
   // Ignore modifier-only presses
   if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return null;
 
+  const isMac = navigator.platform.toUpperCase().includes("MAC");
   const parts: string[] = [];
-  if (e.ctrlKey) parts.push("Ctrl");
+  if (e.ctrlKey && !isMac) parts.push("Ctrl");
+  if (e.metaKey && isMac) parts.push("Super");
+  if (e.ctrlKey && isMac) parts.push("Ctrl");
+  if (e.metaKey && !isMac) parts.push("Super");
   if (e.altKey) parts.push("Alt");
   if (e.shiftKey) parts.push("Shift");
 
@@ -44,7 +48,14 @@ export function keyEventToShortcutString(e: KeyboardEvent): string | null {
 }
 
 export function formatShortcutDisplay(shortcut: string): string {
-  return shortcut; // Already human-readable
+  const isMac = navigator.platform.toUpperCase().includes("MAC");
+  if (!isMac) return shortcut;
+  // Show Mac-friendly symbols
+  return shortcut
+    .replace(/Super\+/g, "\u2318")
+    .replace(/Ctrl\+/g, "\u2303")
+    .replace(/Alt\+/g, "\u2325")
+    .replace(/Shift\+/g, "\u21E7");
 }
 
 export const ACTION_LABELS: Record<string, string> = {

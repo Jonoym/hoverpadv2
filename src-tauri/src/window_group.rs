@@ -331,6 +331,16 @@ unsafe fn clamp_top_to_screen(left: i32, top: i32, right: i32, bottom: i32) -> (
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Derive a stable isize ID from a label string (for non-Windows platforms).
+#[cfg(not(target_os = "windows"))]
+fn label_to_id(label: &str) -> isize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    label.hash(&mut hasher);
+    hasher.finish() as isize
+}
+
 /// Remove an HWND from its group. Returns HWNDs of any remaining members whose
 /// group was dissolved (so the caller can remove their subclasses too).
 fn remove_hwnd_from_group(inner: &mut GroupInner, hwnd: isize) -> Vec<isize> {
@@ -464,8 +474,37 @@ pub async fn group_windows(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, labels, state);
-        Err("Window grouping is only supported on Windows".to_string())
+        // On non-Windows, track group membership without subclassing.
+        // The frontend handles snap positioning; we just maintain the group registry.
+        let mut inner = state.inner.lock().unwrap();
+
+        // Remove labels from any existing groups
+        for label in &labels {
+            // Use a fake hwnd derived from label hash for non-Windows tracking
+            let fake_hwnd = label_to_id(label);
+            if inner.hwnd_to_group.contains_key(&fake_hwnd) {
+                remove_hwnd_from_group(&mut inner, fake_hwnd);
+            }
+        }
+
+        inner.next_group_id += 1;
+        let group_id = inner.next_group_id;
+
+        let members: Vec<GroupMember> = labels
+            .iter()
+            .map(|label| GroupMember {
+                hwnd: label_to_id(label),
+                label: label.clone(),
+            })
+            .collect();
+
+        for member in &members {
+            inner.hwnd_to_group.insert(member.hwnd, group_id);
+        }
+        inner.groups.insert(group_id, members);
+
+        let _ = app;
+        Ok(group_id)
     }
 }
 
@@ -509,8 +548,11 @@ pub async fn ungroup_window(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, label, state);
-        Err("Window grouping is only supported on Windows".to_string())
+        let fake_hwnd = label_to_id(&label);
+        let mut inner = state.inner.lock().unwrap();
+        remove_hwnd_from_group(&mut inner, fake_hwnd);
+        let _ = app;
+        Ok(())
     }
 }
 
@@ -547,8 +589,13 @@ pub async fn ungroup_all(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, state);
-        Err("Window grouping is only supported on Windows".to_string())
+        let mut inner = state.inner.lock().unwrap();
+        inner.groups.clear();
+        inner.hwnd_to_group.clear();
+        inner.last_positions.clear();
+        inner.moving = false;
+        let _ = app;
+        Ok(())
     }
 }
 
@@ -595,8 +642,15 @@ pub async fn ungroup_group(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, group_id, state);
-        Err("Window grouping is only supported on Windows".to_string())
+        let mut inner = state.inner.lock().unwrap();
+        if let Some(members) = inner.groups.remove(&group_id) {
+            for member in &members {
+                inner.hwnd_to_group.remove(&member.hwnd);
+                inner.last_positions.remove(&member.hwnd);
+            }
+        }
+        let _ = app;
+        Ok(())
     }
 }
 
